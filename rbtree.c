@@ -183,6 +183,7 @@ rbtree_alloc(VALUE klass)
     dict_t* dict;
     VALUE rbtree = Data_Wrap_Struct(klass, rbtree_mark, rbtree_free, 0);
     RBTREE(rbtree) = ALLOC(rbtree_t);
+    MEMZERO(RBTREE(rbtree), rbtree_t, 1);
     
     dict = ALLOC(dict_t);
     dict_init(dict, rbtree_cmp);
@@ -194,7 +195,6 @@ rbtree_alloc(VALUE klass)
     DICT(rbtree) = dict;
     IFNONE(rbtree) = Qnil;
     CMP_PROC(rbtree) = Qnil;
-    ITER_LEV(rbtree) = 0;
     return rbtree;
 }
 
