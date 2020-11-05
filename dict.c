@@ -36,7 +36,7 @@ static const char rcsid[] = "$Id: dict.c,v 1.15 2005/10/06 05:16:35 kuma Exp $";
 /*
  * These macros provide short convenient names for structure members,
  * which are embellished with dict_ prefixes so that they are
- * properly confined to the documented namespace. It's legal for a 
+ * properly confined to the documented namespace. It's legal for a
  * program which uses dict to define, for instance, a macro called ``parent''.
  * Such a macro would interfere with the dnode_t struct definition.
  * In general, highly portable and reusable C modules which expose their
@@ -148,7 +148,7 @@ static void free_nodes(dict_t *dict, dnode_t *node, dnode_t *nil)
  * dict_next() successor function, verifying that the key of each node is
  * strictly lower than that of its successor, if duplicates are not allowed,
  * or lower or equal if duplicates are allowed.  This function is used for
- * debugging purposes. 
+ * debugging purposes.
  */
 
 static int verify_bintree(dict_t *dict)
@@ -208,7 +208,7 @@ static unsigned int verify_redblack(dnode_t *nil, dnode_t *root)
 	if (root->color != dnode_black)
 	    return 0;
 	return height_left + 1;
-    } 
+    }
     return 1;
 }
 
@@ -252,7 +252,7 @@ static int verify_dict_has_node(dnode_t *nil, dnode_t *root, dnode_t *node)
 dict_t *dict_create(dict_comp_t comp)
 {
     dict_t* new = ALLOC(dict_t);
-    
+
     if (new) {
 	new->compare = comp;
 	new->allocnode = dnode_alloc;
@@ -340,7 +340,7 @@ dict_t *dict_init(dict_t *dict, dict_comp_t comp)
     return dict;
 }
 
-/* 
+/*
  * Initialize a dictionary in the likeness of another dictionary
  */
 
@@ -378,7 +378,7 @@ static void dict_clear(dict_t *dict)
  * debugging purposes, and should be placed in assert statements.   Just because
  * this function succeeds doesn't mean that the tree is not corrupt. Certain
  * corruptions in the tree may simply cause undefined behavior.
- */ 
+ */
 
 int dict_verify(dict_t *dict)
 {
@@ -432,7 +432,7 @@ int dict_similar(const dict_t *left, const dict_t *right)
 
 /*
  * Locate a node in the dictionary having the given key.
- * If the node is not found, a null a pointer is returned (rather than 
+ * If the node is not found, a null a pointer is returned (rather than
  * a pointer that dictionary's nil sentinel node), otherwise a pointer to the
  * located node is returned.
  */
@@ -483,7 +483,7 @@ dnode_t *dict_lower_bound(dict_t *dict, const void *key)
 
     while (root != nil) {
 	int result = COMPARE(dict, key, root->key);
-        
+
 	if (result > 0) {
 	    root = root->right;
 	} else if (result < 0) {
@@ -498,7 +498,7 @@ dnode_t *dict_lower_bound(dict_t *dict, const void *key)
             }
         }
     }
-    
+
     return tentative;
 }
 
@@ -530,7 +530,7 @@ dnode_t *dict_upper_bound(dict_t *dict, const void *key)
             }
         }
     }
-    
+
     return tentative;
 }
 
@@ -555,7 +555,7 @@ int dict_insert(dict_t *dict, dnode_t *node, const void *key)
     assert (!dnode_is_in_a_dict(node));
 
     /* basic binary tree insert */
-    
+
     while (where != nil) {
 	parent = where;
 	result = COMPARE(dict, key, where->key);
@@ -715,10 +715,10 @@ dnode_t *dict_delete(dict_t *dict, dnode_t *delete)
 
 	child = (delete->left != nil) ? delete->left : delete->right;
 
-	child->parent = delparent = delete->parent;	    
+	child->parent = delparent = delete->parent;
 
 	if (delete == delparent->left) {
-	    delparent->left = child;    
+	    delparent->left = child;
 	} else {
 	    assert (delete == delparent->right);
 	    delparent->right = child;
@@ -1036,7 +1036,7 @@ void dict_load_next(dict_load_t *load, dnode_t *newnode, const void *key)
 {
     dict_t *dict = load->dictptr;
     dnode_t *nil = &load->nilnode;
-    
+
     assert (!dnode_is_in_a_dict(newnode));
     assert (dict->nodecount < DICTCOUNT_T_MAX);
 
@@ -1142,7 +1142,7 @@ void dict_merge(dict_t *dest, dict_t *source)
     dict_load_t load;
     dnode_t *leftnode = dict_first(dest), *rightnode = dict_first(source);
 
-    assert (dict_similar(dest, source));	
+    assert (dict_similar(dest, source));
 
     if (source == dest)
 	return;
@@ -1175,7 +1175,7 @@ void dict_merge(dict_t *dest, dict_t *source)
 	    leftnode = next;
 	    continue;
 	}
-	
+
     copyright:
 	{
 	    dnode_t *next = dict_next(source, rightnode);
@@ -1199,14 +1199,14 @@ int dict_equal(dict_t* dict1, dict_t* dict2,
     dnode_t* node2;
 
     if (dict_count(dict1) != dict_count(dict2))
-        return 0; 
+        return 0;
     if (!dict_similar(dict1, dict2))
         return 0;
-    
+
     for (node1 = dict_first(dict1), node2 = dict_first(dict2);
          node1 != NULL && node2 != NULL;
          node1 = dict_next(dict1, node1), node2 = dict_next(dict2, node2)) {
-        
+
         if (COMPARE(dict1, node1->key, node2->key) != 0)
             return 0;
         if (!value_eql(node1->data, node2->data))
