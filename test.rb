@@ -153,6 +153,8 @@ class RBTreeTest < Test::Unit::TestCase
   end
 
   def test_default
+    assert_equal(nil, @rbtree.default)
+
     rbtree = RBTree.new("e")
     assert_equal("e", rbtree.default)
     assert_equal("e", rbtree.default("f"))
@@ -266,7 +268,17 @@ class RBTreeTest < Test::Unit::TestCase
 
     assert_equal("E", @rbtree.fetch("e", "E"))
     assert_equal("E", @rbtree.fetch("e") { "E" })
-    # assert_equal("E", @rbtree.fetch("e", "F") { "E" })
+
+    class << (stderr = "")
+      alias write <<
+    end
+    $stderr, stderr, $VERBOSE, verbose = stderr, $stderr, false, $VERBOSE
+    begin
+    assert_equal("E", @rbtree.fetch("e", "F") { "E" })
+    ensure
+      $stderr, stderr, $VERBOSE, verbose = stderr, $stderr, verbose, $VERBOSE
+    end
+    assert_match(/warning: block supersedes default value argument/, stderr)
 
     assert_raises(ArgumentError) { @rbtree.fetch }
     assert_raises(ArgumentError) { @rbtree.fetch("e", "E", "E") }
@@ -305,6 +317,31 @@ class RBTreeTest < Test::Unit::TestCase
     if have_enumerator?
       enumerator = @rbtree.each
       assert_equal(%w(a A b B c C d D), enumerator.to_a.flatten)
+    end
+  end
+
+  def test_each_pair
+    ret = []
+    @rbtree.each_pair {|key, val| ret << key << val }
+    assert_equal(%w(a A b B c C d D), ret)
+
+    assert_raises(TypeError) {
+      @rbtree.each_pair { @rbtree["e"] = "E" }
+    }
+    assert_equal(4, @rbtree.size)
+
+    @rbtree.each_pair {
+      @rbtree.each_pair {}
+      assert_raises(TypeError) {
+        @rbtree["e"] = "E"
+      }
+      break
+    }
+    assert_equal(4, @rbtree.size)
+
+    if defined?(Enumerable::Enumerator)
+      enumerator = @rbtree.each_pair
+      assert_equal(%w(a A b B c C d D), enumerator.map.flatten)
     end
   end
 
@@ -590,6 +627,15 @@ class RBTreeTest < Test::Unit::TestCase
     assert_equal([%w(a A), %w(b B), %w(c C), %w(d D)], @rbtree.to_a)
   end
 
+  def test_to_s
+    if RUBY_VERSION < "1.9"
+      assert_equal("aAbBcCdD", @rbtree.to_s)
+    else #Ruby 1.9 Array#to_s behaves differently
+      val = %[#<RBTree: {"a"=>"A", "b"=>"B", "c"=>"C", "d"=>"D"}, default=nil, cmp_proc=nil>]
+      assert_equal(val, @rbtree.to_s)
+    end
+  end
+
   def test_to_hash
     @rbtree.default = "e"
     hash = @rbtree.to_hash
@@ -771,7 +817,6 @@ class RBTreeTest < Test::Unit::TestCase
       assert_raises(TypeError) { @rbtree.readjust(&lambda {|a, b, c, *d| 1 }) }
     end
 
-
     rbtree = RBTree.new
     key = ["a"]
     rbtree[key] = nil
@@ -929,6 +974,15 @@ class MultiRBTreeTest < Test::Unit::TestCase
   def test_to_a
     assert_equal([%w(a A), %w(b B), %w(b C), %w(b D), %w(c C)],
                  @rbtree.to_a)
+  end
+
+  def test_to_s
+    if RUBY_VERSION < "1.9"
+      assert_equal("aAbBbCbDcC", @rbtree.to_s)
+    else
+      val = %[#<MultiRBTree: {"a"=>"A", "b"=>"B", "b"=>"C", "b"=>"D", "c"=>"C"}, default=nil, cmp_proc=nil>]
+      assert_equal(val, @rbtree.to_s)
+    end
   end
 
   def test_to_hash
