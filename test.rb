@@ -11,6 +11,10 @@ class RBTreeTest < Test::Unit::TestCase
     @rbtree = RBTree[*%w(b B d D a A c C)]
   end
   
+  def have_enumerator?
+    defined?(Enumerable::Enumerator) or defined?(Enumerator)
+  end
+  
   def test_new
     assert_nothing_raised {
       RBTree.new
@@ -250,12 +254,6 @@ class RBTreeTest < Test::Unit::TestCase
       b[1] = b
       assert_equal(a, b)
     end
-    
-    # a = RBTree.new
-    # a[1] = a
-    # b = RBTree.new
-    # b[1] = a
-    # assert_not_equal(a, b)
   end
   
   def test_fetch
@@ -304,7 +302,7 @@ class RBTreeTest < Test::Unit::TestCase
     }
     assert_equal(4, @rbtree.size)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       enumerator = @rbtree.each
       assert_equal(%w(a A b B c C d D), enumerator.to_a.flatten)
     end
@@ -329,7 +327,7 @@ class RBTreeTest < Test::Unit::TestCase
     }
     assert_equal(4, @rbtree.size)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       enumerator = @rbtree.each_key
       assert_equal(%w(a b c d), enumerator.to_a.flatten)
     end
@@ -354,7 +352,7 @@ class RBTreeTest < Test::Unit::TestCase
     }
     assert_equal(4, @rbtree.size)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       enumerator = @rbtree.each_value
       assert_equal(%w(A B C D), enumerator.to_a.flatten)
     end
@@ -428,7 +426,7 @@ class RBTreeTest < Test::Unit::TestCase
     }
     assert_equal(0, @rbtree.size)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       rbtree = RBTree[*%w(b B d D a A c C)]
       rbtree.delete_if.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(c C d D)], rbtree)
@@ -440,7 +438,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_same(@rbtree, result)
     assert_equal(RBTree[*%w(a A b B)], @rbtree)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       rbtree = RBTree[*%w(b B d D a A c C)]
       rbtree.keep_if.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(a A b B)], rbtree)
@@ -456,7 +454,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_same(@rbtree, result)
     assert_equal(RBTree[*%w(c C d D)], result)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       rbtree = RBTree[*%w(b B d D a A c C)]
       rbtree.reject!.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(c C d D)], rbtree)
@@ -472,7 +470,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_equal(RBTree[*%w(c C d D)], result)
     assert_equal(4, @rbtree.size)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       result = @rbtree.reject.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(c C d D)], result)
     end
@@ -487,7 +485,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_same(@rbtree, result)
     assert_equal(RBTree[*%w(a A b B)], result)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       rbtree = RBTree[*%w(b B d D a A c C)]
       rbtree.select!.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(a A b B)], rbtree)
@@ -503,7 +501,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_equal(RBTree[*%w(a A b B)], result)
     assert_raises(ArgumentError) { @rbtree.select("c") }
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       result = @rbtree.select.with_index {|(key, val), i| i < 2 }
       assert_equal(RBTree[*%w(a A b B)], result)
     end
@@ -554,13 +552,13 @@ class RBTreeTest < Test::Unit::TestCase
       rbtree[["a"]] = ["A"]
       rbtree[[["b"]]] = [["B"]]
       assert_equal([["a"], ["A"], [["b"]], [["B"]]], rbtree.flatten)
-      assert_equal([[["a"], ["A"]], [[["b"]], [["B"]]]], rbtree.flatten(0))
+      assert_equal([["a"], ["A"], [["b"]], [["B"]]], rbtree.flatten(0))
       assert_equal([["a"], ["A"], [["b"]], [["B"]]], rbtree.flatten(1))
       assert_equal(["a", "A", ["b"], ["B"]], rbtree.flatten(2))
       assert_equal(["a", "A", "b", "B"], rbtree.flatten(3))
       
       assert_raises(TypeError) { @rbtree.flatten("e") }
-      assert_raises(ArgumentError) { @rbtree.flatten(2, 2) } 
+      assert_raises(ArgumentError) { @rbtree.flatten(1, 2) } 
     end
   end
 
@@ -669,7 +667,7 @@ class RBTreeTest < Test::Unit::TestCase
     assert_equal([], rbtree.bound("Y", "Z").to_a)
     assert_equal([], rbtree.bound("f", "g").to_a)
     assert_equal([], rbtree.bound("f", "Z").to_a)
-  
+    
     if defined?(Enumerator) and Enumerator.method_defined?(:size)
       assert_equal(2, rbtree.bound("a", "c").size)
       assert_equal(1, rbtree.bound("a").size)
@@ -821,7 +819,7 @@ class RBTreeTest < Test::Unit::TestCase
     @rbtree.reverse_each { |key, val| result.push([key, val]) }
     assert_equal(%w(d D c C b B a A), result.flatten)
     
-    if defined?(Enumerable::Enumerator) or defined?(Enumerator)
+    if have_enumerator?
       enumerator = @rbtree.reverse_each
       assert_equal(%w(d D c C b B a A), enumerator.to_a.flatten)
     end

@@ -23,11 +23,12 @@
 #endif
 #endif
 
-#ifndef RHASH_TBL
-#define RHASH_TBL(h) RHASH(h)->tbl
+#ifndef RARRAY_AREF
+#define RARRAY_AREF(a, i) (RARRAY_PTR(a)[i])
 #endif
-#ifndef RHASH_IFNONE
-#define RHASH_IFNONE(h) RHASH(h)->ifnone
+
+#ifndef RHASH_SET_IFNONE
+#define RHASH_SET_IFNONE(h, v) (RHASH(h)->ifnone = (v))
 #endif
 
 VALUE RBTree;
@@ -100,15 +101,17 @@ rbtree_free_node(dnode_t* node, void* context)
 }
 
 static void
-rbtree_argc_error(const int argc, const int min, const int max)
+rbtree_check_argument_count(const int argc, const int min, const int max)
 {
-    const char* message = "wrong number of arguments";
-    if (min == max) {
-        rb_raise(rb_eArgError, "%s (%d for %d)", message, argc, min);
-    } else if (max == INT_MAX) {
-        rb_raise(rb_eArgError, "%s (%d for %d+)", message, argc, -min - 1);
-    } else {
-        rb_raise(rb_eArgError, "%s (%d for %d..%d)", message, argc, min, max);
+    if (argc < min || argc > max) {
+        static const char* const  message = "wrong number of arguments";
+        if (min == max) {
+            rb_raise(rb_eArgError, "%s (%d for %d)", message, argc, min);
+        } else if (max == INT_MAX) {
+            rb_raise(rb_eArgError, "%s (%d for %d+)", message, argc, -min - 1);
+        } else {
+            rb_raise(rb_eArgError, "%s (%d for %d..%d)", message, argc, min, max);
+        }
     }
 }
 
@@ -181,7 +184,7 @@ static VALUE
 rbtree_alloc(VALUE klass)
 {
     dict_t* dict;
-    VALUE rbtree = Data_Wrap_Struct(klass, rbtree_mark, rbtree_free, 0);
+    VALUE rbtree = Data_Wrap_Struct(klass, rbtree_mark, rbtree_free, NULL);
     RBTREE(rbtree) = ALLOC(rbtree_t);
     MEMZERO(RBTREE(rbtree), rbtree_t, 1);
     
@@ -248,18 +251,18 @@ rbtree_s_create(int argc, VALUE* argv, VALUE klass)
         if (!NIL_P(temp)) {
             rbtree = rbtree_alloc(klass);
             for (i = 0; i < RARRAY_LEN(temp); i++) {
-                VALUE v = rb_check_array_type(RARRAY_PTR(temp)[i]);
+                VALUE v = rb_check_array_type(RARRAY_AREF(temp, i));
                 if (NIL_P(v)) {
                     rb_warn("wrong element type %s at %ld (expected Array)",
-                            rb_obj_classname(RARRAY_PTR(temp)[i]), i);
+                            rb_obj_classname(RARRAY_AREF(temp, i)), i);
                     continue;
                 }
                 switch(RARRAY_LEN(v)) {
                 case 1:
-                    rbtree_aset(rbtree, RARRAY_PTR(v)[0], Qnil);
+                    rbtree_aset(rbtree, RARRAY_AREF(v, 0), Qnil);
                     break;
                 case 2:
-                    rbtree_aset(rbtree, RARRAY_PTR(v)[0], RARRAY_PTR(v)[1]);
+                    rbtree_aset(rbtree, RARRAY_AREF(v, 0), RARRAY_AREF(v, 1));
                     break;
                 default:
                     rb_warn("invalid number of elements (%ld for 1..2)",
@@ -289,17 +292,14 @@ rbtree_initialize(int argc, VALUE* argv, VALUE self)
 
     if (rb_block_given_p()) {
         VALUE proc;
-        if (argc > 0) {
-            rbtree_argc_error(argc, 0, 0);
-        }
+        rbtree_check_argument_count(argc, 0, 0);
         proc = rb_block_proc();
         rbtree_check_proc_arity(proc, 2);
         IFNONE(self) = proc;
         FL_SET(self, RBTREE_PROC_DEFAULT);
     } else {
-        if (argc > 1) {
-            rbtree_argc_error(argc, 1, 1);
-        } else if (argc == 1) {
+        rbtree_check_argument_count(argc, 0, 1);
+        if (argc == 1) {
             IFNONE(self) = argv[0];
         }
     }
@@ -418,12 +418,9 @@ rbtree_fetch(int argc, VALUE* argv, VALUE self)
 {
     dnode_t* node;
 
-    if (argc == 0 || argc > 2) {
-        rbtree_argc_error(argc, 1, 2);
-    } else if (argc == 2) {
-        if (rb_block_given_p()) {
-            rb_warn("block supersedes default value argument");
-        }
+    rbtree_check_argument_count(argc, 1, 2);
+    if (argc == 2 && rb_block_given_p()) {
+        rb_warn("block supersedes default value argument");
     }
 
     node = dict_lookup(DICT(self), TO_KEY(argv[0]));
@@ -464,9 +461,7 @@ rbtree_empty_p(VALUE self)
 VALUE
 rbtree_default(int argc, VALUE* argv, VALUE self)
 {
-    if (argc > 1) {
-        rbtree_argc_error(argc, 0, 1);
-    }
+    rbtree_check_argument_count(argc, 0, 1);
     if (FL_TEST(self, RBTREE_PROC_DEFAULT)) {
         if (argc == 0) {
             return Qnil;
@@ -752,7 +747,11 @@ static void
 copy_dict(VALUE src, VALUE dest, dict_comp_t cmp_func, VALUE cmp_proc)
 {
     VALUE temp = rbtree_alloc(CLASS_OF(dest));
+#ifdef HAVE_RB_OBJ_HIDE
+    rb_obj_hide(temp);
+#else
     RBASIC(temp)->klass = 0;
+#endif
     DICT(temp)->dict_compare = cmp_func;
     CMP_PROC(temp) = cmp_proc;
 
@@ -763,6 +762,7 @@ copy_dict(VALUE src, VALUE dest, dict_comp_t cmp_func, VALUE cmp_proc)
         DICT(dest) = t;
     }
     rbtree_free(RBTREE(temp));
+    RBTREE(temp) = NULL;
     rb_gc_force_recycle(temp);
 
     DICT(dest)->dict_context = RBTREE(dest);
@@ -840,9 +840,8 @@ VALUE
 rbtree_index(VALUE self, VALUE value)
 {
     VALUE klass = rb_obj_is_kind_of(self, RBTree) ? RBTree : MultiRBTree;
-    volatile VALUE class_name = rb_class_name(klass);
-    rb_warn("%s#index is deprecated; use %s#key",
-            RSTRING_PTR(class_name), RSTRING_PTR(class_name));
+    const char* classname = rb_class2name(klass);
+    rb_warn("%s#index is deprecated; use %s#key", classname, classname);
     return rbtree_key(self, value);
 }
 
@@ -1163,6 +1162,14 @@ rbtree_merge(VALUE self, VALUE other)
     return rbtree_update(rb_obj_dup(self), other);
 }
 
+static each_return_t
+to_flat_ary_i(dnode_t* node, void* ary)
+{
+    rb_ary_push((VALUE)ary, GET_KEY(node));
+    rb_ary_push((VALUE)ary, GET_VAL(node));
+    return EACH_NEXT;
+}
+
 /*
  *
  */
@@ -1170,15 +1177,17 @@ VALUE
 rbtree_flatten(int argc, VALUE* argv, VALUE self)
 {
     VALUE ary;
-    VALUE level;
-    
-    ary = rbtree_to_a(self);
-    if (argc == 0) {
-        argc = 1;
-        level = INT2FIX(1);
-        argv = &level;
+
+    rbtree_check_argument_count(argc, 0, 1);
+    ary = rb_ary_new2(dict_count(DICT(self)) * 2);
+    rbtree_for_each(self, to_flat_ary_i, (void*)ary);
+    if (argc == 1) {
+        const int level = NUM2INT(argv[0]) - 1;
+        if (level > 0) {
+            argv[0] = INT2FIX(level);
+            rb_funcall2(ary, id_flatten_bang, argc, argv);
+        }
     }
-    rb_funcall2(ary, id_flatten_bang, argc, argv);
     return ary;
 }
 
@@ -1289,7 +1298,7 @@ rbtree_to_hash(VALUE self)
     
     hash = rb_hash_new();
     rbtree_for_each(self, to_hash_i, (void*)hash);
-    RHASH_IFNONE(hash) = IFNONE(self);
+    RHASH_SET_IFNONE(hash, IFNONE(self));
     if (FL_TEST(self, RBTREE_PROC_DEFAULT))
         FL_SET(hash, HASH_PROC_DEFAULT);
     OBJ_INFECT(hash, self);
@@ -1308,10 +1317,10 @@ rbtree_to_rbtree(VALUE self)
 static VALUE
 rbtree_begin_inspect(VALUE self)
 {
-    volatile VALUE class_name = rb_class_name(CLASS_OF(self));
-    VALUE str = rb_str_new(NULL, RSTRING_LEN(class_name) + 4);
-    sprintf(RSTRING_PTR(str), "#<%s: ", RSTRING_PTR(class_name));
-    return str;
+    VALUE result = rb_str_new2("#<");
+    rb_str_cat2(result, rb_obj_classname(self));
+    rb_str_cat2(result, ": ");
+    return result;
 }
 
 static each_return_t
@@ -1480,8 +1489,8 @@ rbtree_bound_body(rbtree_bound_arg_t* arg)
 static VALUE
 rbtree_bound_size(VALUE self, VALUE args)
 {
-    VALUE key1 = RARRAY_PTR(args)[0];
-    VALUE key2 = RARRAY_PTR(args)[RARRAY_LEN(args) - 1];
+    VALUE key1 = RARRAY_AREF(args, 0);
+    VALUE key2 = RARRAY_AREF(args, RARRAY_LEN(args) - 1);
     dnode_t* lower_node = dict_lower_bound(DICT(self), TO_KEY(key1));
     dnode_t* upper_node = dict_upper_bound(DICT(self), TO_KEY(key2));
     dictcount_t count = 0;
@@ -1536,9 +1545,7 @@ rbtree_bound(int argc, VALUE* argv, VALUE self)
     dnode_t* upper_node;
     VALUE result;
     
-    if (argc == 0 || argc > 2) {
-        rbtree_argc_error(argc, 1, 2);
-    }
+    rbtree_check_argument_count(argc, 1, 2);
     
     RETURN_SIZED_ENUMERATOR(self, argc, argv, rbtree_bound_size);
     
@@ -1633,17 +1640,16 @@ rbtree_readjust(int argc, VALUE* argv, VALUE self)
     rbtree_modify(self);
 
     if (rb_block_given_p()) {
-        if (argc != 0) {
-            rbtree_argc_error(argc, 0, 0);
-        }
+        rbtree_check_argument_count(argc, 0, 0);
         cmp_func = rbtree_user_cmp;
         cmp_proc = rb_block_proc();
         rbtree_check_proc_arity(cmp_proc, 2);
     } else {
+        rbtree_check_argument_count(argc, 0, 1);
         if (argc == 0) {
             cmp_func = DICT(self)->dict_compare;
             cmp_proc = CMP_PROC(self);
-        } else if (argc == 1) {
+        } else {
             if (NIL_P(argv[0])) {
                 cmp_func = rbtree_cmp;
                 cmp_proc = Qnil;
@@ -1658,8 +1664,6 @@ rbtree_readjust(int argc, VALUE* argv, VALUE self)
                 cmp_proc = proc;
                 rbtree_check_proc_arity(cmp_proc, 2);
             }
-        } else {
-            rbtree_argc_error(argc, 0, 1);
         }
     }
 
@@ -1828,14 +1832,6 @@ rbtree_pretty_print_cycle(VALUE self, VALUE pp)
 
 /*********************************************************************/
 
-static each_return_t
-to_flat_ary_i(dnode_t* node, void* ary)
-{
-    rb_ary_push((VALUE)ary, GET_KEY(node));
-    rb_ary_push((VALUE)ary, GET_VAL(node));
-    return EACH_NEXT;
-}
-
 /* :nodoc:
  *
  */
@@ -1855,8 +1851,11 @@ rbtree_dump(VALUE self, VALUE limit)
     rb_ary_push(ary, IFNONE(self));
 
     result = rb_marshal_dump(ary, limit);
+#ifdef HAVE_RB_ARY_RESIZE
+    rb_ary_resize(ary, 0);
+#else
     rb_ary_clear(ary);
-    rb_gc_force_recycle(ary);
+#endif
     return result;
 }
 
@@ -1868,16 +1867,18 @@ rbtree_s_load(VALUE klass, VALUE str)
 {
     VALUE rbtree = rbtree_alloc(klass);
     VALUE ary = rb_marshal_load(str);
-    VALUE* ptr = RARRAY_PTR(ary);
     long len = RARRAY_LEN(ary) - 1;
     long i;
     
     for (i = 0; i < len; i += 2)
-        rbtree_aset(rbtree, ptr[i], ptr[i + 1]);
-    IFNONE(rbtree) = ptr[len];
+        rbtree_aset(rbtree, RARRAY_AREF(ary, i), RARRAY_AREF(ary, i + 1));
+    IFNONE(rbtree) = RARRAY_AREF(ary, len);
     
+#ifdef HAVE_RB_ARY_RESIZE
+    rb_ary_resize(ary, 0);
+#else
     rb_ary_clear(ary);
-    rb_gc_force_recycle(ary);
+#endif
     return rbtree;
 }
 

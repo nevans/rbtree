@@ -14,12 +14,12 @@
  * into proprietary software; there is no requirement for such software to
  * contain a copyright notice related to this source.
  *
- * $Id: dict.h,v 1.9 2005/10/06 05:16:35 kuma Exp $
- * $Name:  $
+ * $Id: dict.h,v 1.22.2.6 2000/11/13 01:36:44 kaz Exp $
+ * $Name: kazlib_1_20 $
  */
 
 /*
- * Modified for Ruby/RBTree by OZAWA Takuma.
+ * Modified for Ruby/RBTree.
  */
 
 #ifndef DICT_H

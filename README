@@ -57,6 +57,9 @@ Run the following command.
   $ sudo gem install rbtree
 
 == Changes
+=== 0.4.2
+* Fixed build failure with Ruby 2.1.0.
+
 === 0.4.1
 * Fixed a crash that could be triggered when GC happened.
 
@@ -78,9 +81,3 @@ dict.c and dict.h are modified copies that are originally in Kazlib
 1.20 written by Kaz Kylheku. Its license is similar to the MIT
 license. See dict.c and dict.h for the details. The web page of Kazlib
 is at http://www.kylheku.com/~kaz/kazlib.html.
-
-== Contact
-
-Run the following command.
-
-  $ ruby -e "puts 'YnVybmluZ2Rvd250aGVvcGVyYUB5YWhvby5jby5qcA==\n'.unpack('m')"
