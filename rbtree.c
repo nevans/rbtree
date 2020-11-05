@@ -1836,7 +1836,7 @@ rbtree_pretty_print_cycle(VALUE self, VALUE pp)
  *
  */
 VALUE
-rbtree_dump(VALUE self, VALUE limit)
+rbtree_dump(VALUE self, VALUE _limit)
 {
     VALUE ary;
     VALUE result;
@@ -1850,7 +1850,7 @@ rbtree_dump(VALUE self, VALUE limit)
     rbtree_for_each(self, to_flat_ary_i, (void*)ary);
     rb_ary_push(ary, IFNONE(self));
 
-    result = rb_marshal_dump(ary, limit);
+    result = rb_marshal_dump(ary, Qnil);
 #ifdef HAVE_RB_ARY_RESIZE
     rb_ary_resize(ary, 0);
 #else
