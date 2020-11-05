@@ -1,18 +1,26 @@
 /*
  * MIT License
- * Copyright (c) 2002-2004, 2007, 2009 OZAWA Takuma
+ * Copyright (c) 2002-2013 OZAWA Takuma
  */
-#include <ruby/ruby.h>
-#include <ruby/version.h>
+#include <ruby.h>
+#ifdef HAVE_RUBY_ST_H
 #include <ruby/st.h>
-#include <stdarg.h>
+#else
+#include <st.h>
+#endif
 #include "dict.h"
 
 #define RBTREE_PROC_DEFAULT FL_USER2
 #define HASH_PROC_DEFAULT   FL_USER2
 
-#ifndef RETURN_ENUMERATOR
-#define RETURN_ENUMERATOR(obj, argc, argv) ((void)0)
+#ifdef RETURN_SIZED_ENUMERATOR
+#define HAVE_SIZED_ENUMERATOR
+#else
+#ifdef RETURN_ENUMERATOR
+#define RETURN_SIZED_ENUMERATOR(obj, argc, argv, size_fn) RETURN_ENUMERATOR(obj, argc, argv)
+#else
+#define RETURN_SIZED_ENUMERATOR(obj, argc, argv, size_fn) ((void)0)
+#endif
 #endif
 
 #ifndef RHASH_TBL
@@ -25,23 +33,23 @@
 VALUE RBTree;
 VALUE MultiRBTree;
 
-static ID id_bound;
 static ID id_cmp;
 static ID id_call;
 static ID id_default;
+static ID id_flatten_bang;
 
 typedef struct {
     dict_t* dict;
     VALUE ifnone;
+    VALUE cmp_proc;
     int iter_lev;
 } rbtree_t;
 
 #define RBTREE(rbtree) DATA_PTR(rbtree)
 #define DICT(rbtree) ((rbtree_t*)RBTREE(rbtree))->dict
 #define IFNONE(rbtree) ((rbtree_t*)RBTREE(rbtree))->ifnone
+#define CMP_PROC(rbtree) ((rbtree_t*)RBTREE(rbtree))->cmp_proc
 #define ITER_LEV(rbtree) ((rbtree_t*)RBTREE(rbtree))->iter_lev
-#define COMPARE(rbtree) DICT(rbtree)->dict_compare
-#define CONTEXT(rbtree) DICT(rbtree)->dict_context
 
 #define TO_KEY(arg) ((const void*)arg)
 #define TO_VAL(arg) ((void*)arg)
@@ -51,17 +59,11 @@ typedef struct {
 
 /*********************************************************************/
 
-static int
-cmpint(VALUE i, VALUE a, VALUE b)
-{
-    return rb_cmpint(i, a, b);
-}
-
 static void
 rbtree_free(rbtree_t* rbtree)
 {
     dict_free_nodes(rbtree->dict);
-    dict_destroy(rbtree->dict);
+    xfree(rbtree->dict);
     xfree(rbtree);
 }
 
@@ -80,9 +82,9 @@ rbtree_mark(rbtree_t* rbtree)
             rb_gc_mark(GET_KEY(node));
             rb_gc_mark(GET_VAL(node));
         }
-        rb_gc_mark((VALUE)dict->dict_context);
     }
     rb_gc_mark(rbtree->ifnone);
+    rb_gc_mark(rbtree->cmp_proc);
 }
 
 static dnode_t*
@@ -98,36 +100,79 @@ rbtree_free_node(dnode_t* node, void* context)
 }
 
 static void
-rbtree_argc_error()
+rbtree_argc_error(const int argc, const int min, const int max)
 {
-    rb_raise(rb_eArgError, "wrong number of arguments");
+    const char* message = "wrong number of arguments";
+    if (min == max) {
+        rb_raise(rb_eArgError, "%s (%d for %d)", message, argc, min);
+    } else if (max == INT_MAX) {
+        rb_raise(rb_eArgError, "%s (%d for %d+)", message, argc, -min - 1);
+    } else {
+        rb_raise(rb_eArgError, "%s (%d for %d..%d)", message, argc, min, max);
+    }
+}
+
+static void
+rbtree_check_proc_arity(VALUE proc, const int expected)
+{
+#ifdef HAVE_RB_PROC_LAMBDA_P
+    if (rb_proc_lambda_p(proc)) {
+        const int arity = rb_proc_arity(proc);
+        const int min = arity < 0 ? -arity - 1 : arity;
+        const int max = arity < 0 ? INT_MAX : arity;
+        if (expected < min || expected > max) {
+            rb_raise(rb_eTypeError, "proc takes %d arguments", expected);
+        }
+    }
+#endif
 }
 
 static int
 rbtree_cmp(const void* key1, const void* key2, void* context)
 {
-    VALUE ret;
+    VALUE result;
     if (TYPE(key1) == T_STRING && TYPE(key2) == T_STRING)
         return rb_str_cmp((VALUE)key1, (VALUE)key2);
-    ret = rb_funcall((VALUE)key1, id_cmp, 1, (VALUE)key2);
-    return cmpint(ret, (VALUE)key1, (VALUE)key2);
+    result = rb_funcall2((VALUE)key1, id_cmp, 1, (VALUE*)&key2);
+    return rb_cmpint(result, (VALUE)key1, (VALUE)key2);
+}
+
+static VALUE
+rbtree_user_cmp_ensure(rbtree_t* rbtree)
+{
+    rbtree->iter_lev--;
+    return Qnil;
+}
+
+static VALUE
+rbtree_user_cmp_body(VALUE* args)
+{
+    rbtree_t* rbtree = (rbtree_t*)args[2];
+    rbtree->iter_lev++;
+    return rb_funcall2(rbtree->cmp_proc, id_call, 2, args);
 }
 
 static int
-rbtree_user_cmp(const void* key1, const void* key2, void* cmp_proc)
+rbtree_user_cmp(const void* key1, const void* key2, void* context)
 {
-    VALUE ret = rb_funcall((VALUE)cmp_proc, id_call, 2,
-                           (VALUE)key1, (VALUE)key2);
-    return cmpint(ret, (VALUE)key1, (VALUE)key2);
+    rbtree_t* rbtree = (rbtree_t*)context;
+    VALUE args[3];
+    VALUE result;
+
+    args[0] = (VALUE)key1;
+    args[1] = (VALUE)key2;
+    args[2] = (VALUE)rbtree;
+    result = rb_ensure(rbtree_user_cmp_body, (VALUE)&args,
+                       rbtree_user_cmp_ensure, (VALUE)rbtree);
+    return rb_cmpint(result, (VALUE)key1, (VALUE)key2);
 }
 
 static void
 rbtree_modify(VALUE self)
 {
     if (ITER_LEV(self) > 0)
-        rb_raise(rb_eTypeError, "can't modify rbtree in iteration");
-    if (OBJ_FROZEN(self))
-        rb_error_frozen("rbtree");
+        rb_raise(rb_eTypeError, "can't modify rbtree during iteration");
+    rb_check_frozen(self);
     if (!OBJ_TAINTED(self) && rb_safe_level() >= 4)
         rb_raise(rb_eSecurityError, "Insecure: can't modify rbtree");
 }
@@ -138,23 +183,25 @@ rbtree_alloc(VALUE klass)
     dict_t* dict;
     VALUE rbtree = Data_Wrap_Struct(klass, rbtree_mark, rbtree_free, 0);
     RBTREE(rbtree) = ALLOC(rbtree_t);
-    MEMZERO(RBTREE(rbtree), rbtree_t, 1);
-
-    dict = dict_create(rbtree_cmp);
+    
+    dict = ALLOC(dict_t);
+    dict_init(dict, rbtree_cmp);
     dict_set_allocator(dict, rbtree_alloc_node, rbtree_free_node,
-                       (void*)Qnil);
-    if (klass == MultiRBTree)
+                       RBTREE(rbtree));
+    if (!RTEST(rb_class_inherited_p(klass, RBTree)))
         dict_allow_dupes(dict);
     
     DICT(rbtree) = dict;
     IFNONE(rbtree) = Qnil;
+    CMP_PROC(rbtree) = Qnil;
+    ITER_LEV(rbtree) = 0;
     return rbtree;
 }
 
 VALUE rbtree_aset(VALUE, VALUE, VALUE);
-VALUE rbtree_clear(VALUE);
 VALUE rbtree_has_key(VALUE, VALUE);
 VALUE rbtree_update(VALUE, VALUE);
+VALUE rbtree_to_a(VALUE);
 
 /*********************************************************************/
 
@@ -176,11 +223,7 @@ rbtree_s_create(int argc, VALUE* argv, VALUE klass)
     VALUE rbtree;
     
     if (argc == 1) {
-        VALUE tmp;
-        
-        if (klass == RBTree && CLASS_OF(argv[0]) == MultiRBTree) {
-            rb_raise(rb_eTypeError, "can't convert MultiRBTree to RBTree");
-        }
+        VALUE temp;
         
         if (rb_obj_is_kind_of(argv[0], klass)) {
             rbtree = rbtree_alloc(klass);
@@ -188,19 +231,27 @@ rbtree_s_create(int argc, VALUE* argv, VALUE klass)
             return rbtree;
         }
         
-        tmp = rb_check_convert_type(argv[0], T_HASH, "Hash", "to_hash");
-        if (!NIL_P(tmp)) {
+        if (RTEST(rb_class_inherited_p(klass, RBTree)) &&
+            (rb_obj_is_kind_of(argv[0], MultiRBTree) && !rb_obj_is_kind_of(argv[0], RBTree))) {
+            
+            rb_raise(rb_eTypeError, "wrong argument type MultiRBTree (expected RBTree)");
+        }
+        
+        temp = rb_check_convert_type(argv[0], T_HASH, "Hash", "to_hash");
+        if (!NIL_P(temp)) {
             rbtree = rbtree_alloc(klass);
-            st_foreach(RHASH_TBL(tmp), hash_to_rbtree_i, rbtree);
+            rb_hash_foreach(temp, hash_to_rbtree_i, rbtree);
             return rbtree;
         }
         
-        tmp = rb_check_array_type(argv[0]);
-        if (!NIL_P(tmp)) {
+        temp = rb_check_array_type(argv[0]);
+        if (!NIL_P(temp)) {
             rbtree = rbtree_alloc(klass);
-            for (i = 0; i < RARRAY_LEN(tmp); i++) {
-                VALUE v = rb_check_array_type(RARRAY_PTR(tmp)[i]);
+            for (i = 0; i < RARRAY_LEN(temp); i++) {
+                VALUE v = rb_check_array_type(RARRAY_PTR(temp)[i]);
                 if (NIL_P(v)) {
+                    rb_warn("wrong element type %s at %ld (expected Array)",
+                            rb_obj_classname(RARRAY_PTR(temp)[i]), i);
                     continue;
                 }
                 switch(RARRAY_LEN(v)) {
@@ -211,7 +262,8 @@ rbtree_s_create(int argc, VALUE* argv, VALUE klass)
                     rbtree_aset(rbtree, RARRAY_PTR(v)[0], RARRAY_PTR(v)[1]);
                     break;
                 default:
-                    continue;
+                    rb_warn("invalid number of elements (%ld for 1..2)",
+                            RARRAY_LEN(v));
                 }
             }
             return rbtree;
@@ -219,7 +271,7 @@ rbtree_s_create(int argc, VALUE* argv, VALUE klass)
     }
     
     if (argc % 2 != 0)
-        rb_raise(rb_eArgError, "odd number of arguments for RBTree");
+        rb_raise(rb_eArgError, "odd number of arguments for %s", rb_class2name(klass));
 
     rbtree = rbtree_alloc(klass);
     for (i = 0; i < argc; i += 2)
@@ -236,15 +288,20 @@ rbtree_initialize(int argc, VALUE* argv, VALUE self)
     rbtree_modify(self);
 
     if (rb_block_given_p()) {
-        if (argc > 0)
-            rbtree_argc_error();
-        IFNONE(self) = rb_block_proc();
+        VALUE proc;
+        if (argc > 0) {
+            rbtree_argc_error(argc, 0, 0);
+        }
+        proc = rb_block_proc();
+        rbtree_check_proc_arity(proc, 2);
+        IFNONE(self) = proc;
         FL_SET(self, RBTREE_PROC_DEFAULT);
     } else {
-        if (argc > 1)
-            rbtree_argc_error();
-        else if (argc == 1)
+        if (argc > 1) {
+            rbtree_argc_error(argc, 1, 1);
+        } else if (argc == 1) {
             IFNONE(self) = argv[0];
+        }
     }
     return self;
 }
@@ -252,41 +309,49 @@ rbtree_initialize(int argc, VALUE* argv, VALUE self)
 /*********************************************************************/
 
 typedef enum {
-    INITIAL_VALUE, NODE_NOT_FOUND, NODE_FOUND
-} insert_node_ret_t;
+    NoNodeInserted,
+    KeyAllocationFailed,
+    InsertionSucceeded
+} insert_result_t;
 
 typedef struct {
     dict_t* dict;
     dnode_t* node;
-    const void* key;
-    insert_node_ret_t ret;
-} insert_node_t;
+    insert_result_t result;
+} rbtree_insert_arg_t;
 
 static VALUE
-insert_node_body(insert_node_t* arg)
+insert_node_body(rbtree_insert_arg_t* arg)
 {
-    if (dict_insert(arg->dict, arg->node, arg->key))
-        arg->ret = NODE_NOT_FOUND;
-    else
-        arg->ret = NODE_FOUND;
+    dict_t* dict = arg->dict;
+    dnode_t* node = arg->node;
+    
+    if (dict_insert(dict, node, dnode_getkey(node))) {
+        if (TYPE(GET_KEY(node)) == T_STRING) {
+            arg->result = KeyAllocationFailed;
+            node->dict_key = TO_KEY(rb_str_new4(GET_KEY(node)));
+        }
+    } else {
+        dict->dict_freenode(node, dict->dict_context);
+    }
+    arg->result = InsertionSucceeded;
     return Qnil;
 }
 
 static VALUE
-insert_node_ensure(insert_node_t* arg)
+insert_node_ensure(rbtree_insert_arg_t* arg)
 {
     dict_t* dict = arg->dict;
     dnode_t* node = arg->node;
-    switch (arg->ret) {
-    case INITIAL_VALUE:
+    
+    switch (arg->result) {
+    case InsertionSucceeded:
+        break;
+    case NoNodeInserted:
         dict->dict_freenode(node, dict->dict_context);
         break;
-    case NODE_NOT_FOUND:
-        if (TYPE(arg->key) == T_STRING)
-            node->dict_key = TO_KEY(rb_str_new4(GET_KEY(node)));
-        break;
-    case NODE_FOUND:
-        dict->dict_freenode(node, dict->dict_context);
+    case KeyAllocationFailed:
+        dict_delete_free(dict, node);
         break;
     }
     return Qnil;
@@ -295,16 +360,16 @@ insert_node_ensure(insert_node_t* arg)
 static void
 rbtree_insert(VALUE self, VALUE key, VALUE value)
 {
-    insert_node_t arg;
+    rbtree_insert_arg_t arg;
     dict_t* dict = DICT(self);
     dnode_t* node = dict->dict_allocnode(dict->dict_context);
 
     dnode_init(node, TO_VAL(value));
-
+    node->dict_key = TO_KEY(key);
+    
     arg.dict = dict;
     arg.node = node;
-    arg.key = TO_KEY(key);
-    arg.ret = INITIAL_VALUE;
+    arg.result = NoNodeInserted;
 
     rb_ensure(insert_node_body, (VALUE)&arg,
               insert_node_ensure, (VALUE)&arg);
@@ -340,7 +405,7 @@ rbtree_aref(VALUE self, VALUE key)
 {
     dnode_t* node = dict_lookup(DICT(self), TO_KEY(key));
     if (node == NULL)
-        return rb_funcall(self, id_default, 1, key);
+        return rb_funcall2(self, id_default, 1, &key);
     else
         return GET_VAL(node);
 }
@@ -352,22 +417,26 @@ VALUE
 rbtree_fetch(int argc, VALUE* argv, VALUE self)
 {
     dnode_t* node;
-    int block_given;
 
-    if (argc == 0 || argc > 2)
-        rbtree_argc_error();
-    block_given = rb_block_given_p();
-    if (block_given && argc == 2)
-	rb_warn("block supersedes default value argument");
+    if (argc == 0 || argc > 2) {
+        rbtree_argc_error(argc, 1, 2);
+    } else if (argc == 2) {
+        if (rb_block_given_p()) {
+            rb_warn("block supersedes default value argument");
+        }
+    }
 
     node = dict_lookup(DICT(self), TO_KEY(argv[0]));
-    if (node != NULL)
+    if (node != NULL) {
         return GET_VAL(node);
+    }
 
-    if (block_given)
+    if (rb_block_given_p()) {
         return rb_yield(argv[0]);
-    if (argc == 1)
+    }
+    if (argc == 1) {
         rb_raise(rb_eIndexError, "key not found");
+    }
     return argv[1];
 }
 
@@ -395,15 +464,14 @@ rbtree_empty_p(VALUE self)
 VALUE
 rbtree_default(int argc, VALUE* argv, VALUE self)
 {
-    VALUE key = Qnil;
-    if (argc == 1)
-        key = argv[0];
-    else if (argc > 1)
-        rbtree_argc_error();
-
+    if (argc > 1) {
+        rbtree_argc_error(argc, 0, 1);
+    }
     if (FL_TEST(self, RBTREE_PROC_DEFAULT)) {
-        if (argc == 0) return Qnil;
-        return rb_funcall(IFNONE(self), id_call, 2, self, key);
+        if (argc == 0) {
+            return Qnil;
+        }
+        return rb_funcall(IFNONE(self), id_call, 2, self, argv[0]);
     }
     return IFNONE(self);
 }
@@ -431,10 +499,54 @@ rbtree_default_proc(VALUE self)
     return Qnil;
 }
 
-static int
-value_eq(const void* key1, const void* key2)
+/*
+ *
+ */
+VALUE
+rbtree_set_default_proc(VALUE self, VALUE proc)
 {
-    return rb_equal((VALUE)key1, (VALUE)key2) != 0;
+    VALUE temp;
+    
+    rbtree_modify(self);
+    if (NIL_P(proc)) {
+        IFNONE(self) = Qnil;
+        FL_UNSET(self, RBTREE_PROC_DEFAULT);
+        return Qnil;
+    }
+    
+    temp = rb_check_convert_type(proc, T_DATA, "Proc", "to_proc");
+    if (NIL_P(temp)) {
+        rb_raise(rb_eTypeError,
+                 "wrong default_proc type %s (expected Proc)",
+                 rb_obj_classname(proc));
+    }
+    rbtree_check_proc_arity(temp, 2);
+    IFNONE(self) = temp;
+    FL_SET(self, RBTREE_PROC_DEFAULT);
+    return proc;
+}
+
+static VALUE
+rbtree_recursive_equal(VALUE self, VALUE other, int recursive)
+{
+    dict_t* dict1 = DICT(self);
+    dict_t* dict2 = DICT(other);
+    dnode_t* node1;
+    dnode_t* node2;
+    
+    if (recursive)
+        return Qtrue;
+    for (node1 = dict_first(dict1), node2 = dict_first(dict2);
+         node1 != NULL && node2 != NULL;
+         node1 = dict_next(dict1, node1), node2 = dict_next(dict2, node2)) {
+        
+        if (!rb_equal(GET_KEY(node1), GET_KEY(node2)) ||
+            !rb_equal(GET_VAL(node1), GET_VAL(node2))) {
+            
+            return Qfalse;
+        }
+    }
+    return Qtrue;
 }
 
 /*
@@ -443,13 +555,23 @@ value_eq(const void* key1, const void* key2)
 VALUE
 rbtree_equal(VALUE self, VALUE other)
 {
-    int ret;
     if (self == other)
         return Qtrue;
     if (!rb_obj_is_kind_of(other, MultiRBTree))
         return Qfalse;
-    ret = dict_equal(DICT(self), DICT(other), value_eq);
-    return ret ? Qtrue : Qfalse;
+    if (dict_count(DICT(self)) != dict_count(DICT(other)) ||
+        DICT(self)->dict_compare != DICT(other)->dict_compare ||
+        CMP_PROC(self) != CMP_PROC(other)) {
+        
+        return Qfalse;
+    }
+#if defined(HAVE_RB_EXEC_RECURSIVE_PAIRED)
+    return rb_exec_recursive_paired(rbtree_recursive_equal, self, other, other);
+#elif defined(HAVE_RB_EXEC_RECURSIVE)
+    return rb_exec_recursive(rbtree_recursive_equal, self, other);
+#else
+    return rbtree_recursive_equal(self, other, 0);
+#endif
 }
 
 /*********************************************************************/
@@ -529,7 +651,7 @@ rbtree_reverse_for_each(VALUE self, each_callback_func func, void* arg)
 /*********************************************************************/
 
 static each_return_t
-each_i(dnode_t* node, void* arg)
+each_pair_i(dnode_t* node, void* arg)
 {
     rb_yield(ASSOC(node));
     return EACH_NEXT;
@@ -537,36 +659,20 @@ each_i(dnode_t* node, void* arg)
 
 /*
  * call-seq:
- *   rbtree.each {|key, value| block} => rbtree
- *
- * Calls block once for each key in order, passing the key and value
- * as a two-element array parameters.
- */
-VALUE
-rbtree_each(VALUE self)
-{
-    RETURN_ENUMERATOR(self, 0, NULL);
-    return rbtree_for_each(self, each_i, NULL);
-}
-
-static each_return_t
-each_pair_i(dnode_t* node, void* arg)
-{
-    rb_yield_values(2, GET_KEY(node), GET_VAL(node));
-    return EACH_NEXT;
-}
-
-/*
- * call-seq:
+ *   rbtree.each      {|key, value| block} => rbtree
  *   rbtree.each_pair {|key, value| block} => rbtree
+ *   rbtree.each                           => enumerator
+ *   rbtree.each_pair                      => enumerator
  *
- * Calls block once for each key in order, passing the key and value
+ * Calls block once for each key in order, passing the key-value pair
  * as parameters.
+ *
+ * Returns an enumerator if no block is given.
  */
 VALUE
 rbtree_each_pair(VALUE self)
 {
-    RETURN_ENUMERATOR(self, 0, NULL);
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
     return rbtree_for_each(self, each_pair_i, NULL);
 }
 
@@ -580,14 +686,17 @@ each_key_i(dnode_t* node, void* arg)
 /*
  * call-seq:
  *   rbtree.each_key {|key| block} => rbtree
+ *   rbtree.each_key               => enumerator
  *
- * Calls block once for each key in order, passing the key as
- * parameters.
+ * Calls block once for each key in order, passing the key as a
+ * parameter.
+ *
+ * Returns an enumerator if no block is given.
  */
 VALUE
 rbtree_each_key(VALUE self)
 {
-    RETURN_ENUMERATOR(self, 0, NULL);
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
     return rbtree_for_each(self, each_key_i, NULL);
 }
 
@@ -601,28 +710,34 @@ each_value_i(dnode_t* node, void* arg)
 /*
  * call-seq:
  *   rbtree.each_value {|value| block} => rbtree
+ *   rbtree.each_value                 => enumerator
  *
- * Calls block once for each key in order, passing the value as
- * parameters.
+ * Calls block once for each key in order, passing the value as a
+ * parameter.
+ *
+ * Returns an enumerator if no block is given.
  */
 VALUE
 rbtree_each_value(VALUE self)
 {
-    RETURN_ENUMERATOR(self, 0, NULL);
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
     return rbtree_for_each(self, each_value_i, NULL);
 }
 
 /*
  * call-seq:
  *   rbtree.reverse_each {|key, value| block} => rbtree
+ *   rbtree.reverse_each                      => enumerator
  *
- * Calls block once for each key in reverse order, passing the key and
- * value as parameters.
+ * Calls block once for each key in reverse order, passing the
+ * key-value pair as parameters.
+ *
+ * Returns an enumerator if no block is given.
  */
 VALUE
 rbtree_reverse_each(VALUE self)
 {
-    RETURN_ENUMERATOR(self, 0, NULL);
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
     return rbtree_reverse_for_each(self, each_pair_i, NULL);
 }
 
@@ -634,11 +749,13 @@ aset_i(dnode_t* node, void* self)
 }
 
 static void
-copy_dict(VALUE src, VALUE dest, dict_comp_t cmp,  void* context)
+copy_dict(VALUE src, VALUE dest, dict_comp_t cmp_func, VALUE cmp_proc)
 {
     VALUE temp = rbtree_alloc(CLASS_OF(dest));
-    COMPARE(temp) = cmp;
-    CONTEXT(temp) = context;
+    RBASIC(temp)->klass = 0;
+    DICT(temp)->dict_compare = cmp_func;
+    CMP_PROC(temp) = cmp_proc;
+
     rbtree_for_each(src, aset_i, (void*)temp);
     {
         dict_t* t = DICT(temp);
@@ -647,6 +764,9 @@ copy_dict(VALUE src, VALUE dest, dict_comp_t cmp,  void* context)
     }
     rbtree_free(RBTREE(temp));
     rb_gc_force_recycle(temp);
+
+    DICT(dest)->dict_context = RBTREE(dest);
+    CMP_PROC(dest) = cmp_proc;
 }
 
 /*
@@ -655,15 +775,17 @@ copy_dict(VALUE src, VALUE dest, dict_comp_t cmp,  void* context)
 VALUE
 rbtree_initialize_copy(VALUE self, VALUE other)
 {
+    rbtree_modify(self);
+    
     if (self == other)
         return self;
     if (!rb_obj_is_kind_of(other, CLASS_OF(self))) {
         rb_raise(rb_eTypeError, "wrong argument type %s (expected %s)",
-                 rb_class2name(CLASS_OF(other)),
-                 rb_class2name(CLASS_OF(self)));
+                 rb_obj_classname(other),
+                 rb_obj_classname(self));
     }
     
-    copy_dict(other, self, COMPARE(other), CONTEXT(other));
+    copy_dict(other, self, DICT(other)->dict_compare, CMP_PROC(other));
     
     IFNONE(self) = IFNONE(other);
     if (FL_TEST(other, RBTREE_PROC_DEFAULT))
@@ -680,7 +802,7 @@ VALUE
 rbtree_values_at(int argc, VALUE* argv, VALUE self)
 {
     long i;
-    VALUE ary = rb_ary_new();
+    VALUE ary = rb_ary_new2(argc);
     
     for (i = 0; i < argc; i++)
         rb_ary_push(ary, rbtree_aref(self, argv[i]));
@@ -688,33 +810,11 @@ rbtree_values_at(int argc, VALUE* argv, VALUE self)
 }
 
 static each_return_t
-select_i(dnode_t* node, void* ary)
+key_i(dnode_t* node, void* args_)
 {
-    if (RTEST(rb_yield_values(2, GET_KEY(node), GET_VAL(node))))
-        rb_ary_push((VALUE)ary, ASSOC(node));
-    return EACH_NEXT;
-}
-
-/*
- *
- */
-VALUE
-rbtree_select(VALUE self)
-{
-    VALUE ary;
-    
-    RETURN_ENUMERATOR(self, 0, NULL);
-    ary = rb_ary_new();
-    rbtree_for_each(self, select_i, (void*)ary);
-    return ary;
-}
-
-static each_return_t
-index_i(dnode_t* node, void* arg_)
-{
-    VALUE* arg = (VALUE*)arg_;
-    if (rb_equal(GET_VAL(node), arg[1])) {
-        arg[0] = GET_KEY(node);
+    VALUE* args = (VALUE*)args_;
+    if (rb_equal(GET_VAL(node), args[1])) {
+        args[0] = GET_KEY(node);
         return EACH_STOP;
     }
     return EACH_NEXT;
@@ -724,13 +824,26 @@ index_i(dnode_t* node, void* arg_)
  *
  */
 VALUE
+rbtree_key(VALUE self, VALUE value)
+{
+    VALUE args[2];
+    args[0] = Qnil;
+    args[1] = value;
+    rbtree_for_each(self, key_i, &args);
+    return args[0];
+}
+
+/*
+ *
+ */
+VALUE
 rbtree_index(VALUE self, VALUE value)
 {
-    VALUE arg[2];
-    arg[0] = Qnil;
-    arg[1] = value;
-    rbtree_for_each(self, index_i, (void*)&arg);
-    return arg[0];
+    VALUE klass = rb_obj_is_kind_of(self, RBTree) ? RBTree : MultiRBTree;
+    volatile VALUE class_name = rb_class_name(klass);
+    rb_warn("%s#index is deprecated; use %s#key",
+            RSTRING_PTR(class_name), RSTRING_PTR(class_name));
+    return rbtree_key(self, value);
 }
 
 /*
@@ -774,10 +887,11 @@ typedef struct {
     VALUE self;
     dnode_list_t* list;
     int raised;
-} rbtree_delete_if_arg_t;
+    int if_true;
+} rbtree_remove_if_arg_t;
 
 static VALUE
-rbtree_delete_if_ensure(rbtree_delete_if_arg_t* arg)
+rbtree_remove_if_ensure(rbtree_remove_if_arg_t* arg)
 {
     dict_t* dict = DICT(arg->self);
     dnode_list_t* list = arg->list;
@@ -795,7 +909,7 @@ rbtree_delete_if_ensure(rbtree_delete_if_arg_t* arg)
 }
 
 static VALUE
-rbtree_delete_if_body(rbtree_delete_if_arg_t* arg)
+rbtree_remove_if_body(rbtree_remove_if_arg_t* arg)
 {
     VALUE self = arg->self;
     dict_t* dict = DICT(self);
@@ -807,7 +921,9 @@ rbtree_delete_if_body(rbtree_delete_if_arg_t* arg)
          node != NULL;
          node = dict_next(dict, node)) {
 
-        if (RTEST(rb_yield_values(2, GET_KEY(node), GET_VAL(node)))) {
+        VALUE key = GET_KEY(node);
+        VALUE value = GET_VAL(node);
+        if (RTEST(rb_yield_values(2, key, value)) == arg->if_true) {
             dnode_list_t* l = ALLOC(dnode_list_t);
             l->node = node;
             l->prev = arg->list;
@@ -818,6 +934,20 @@ rbtree_delete_if_body(rbtree_delete_if_arg_t* arg)
     return self;
 }
 
+static VALUE
+rbtree_remove_if(VALUE self, const int if_true)
+{
+    rbtree_remove_if_arg_t arg;
+    
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
+    rbtree_modify(self);
+    arg.self = self;
+    arg.list = NULL;
+    arg.if_true = if_true;
+    return rb_ensure(rbtree_remove_if_body, (VALUE)&arg,
+                     rbtree_remove_if_ensure, (VALUE)&arg);
+}
+
 /*********************************************************************/
 
 /*
@@ -826,14 +956,16 @@ rbtree_delete_if_body(rbtree_delete_if_arg_t* arg)
 VALUE
 rbtree_delete_if(VALUE self)
 {
-    rbtree_delete_if_arg_t arg;
-    
-    RETURN_ENUMERATOR(self, 0, NULL);
-    rbtree_modify(self);
-    arg.self = self;
-    arg.list = NULL;
-    return rb_ensure(rbtree_delete_if_body, (VALUE)&arg,
-                     rbtree_delete_if_ensure, (VALUE)&arg);
+    return rbtree_remove_if(self, 1);
+}
+
+/*
+ *
+ */
+VALUE
+rbtree_keep_if(VALUE self)
+{
+    return rbtree_remove_if(self, 0);
 }
 
 /*
@@ -844,7 +976,7 @@ rbtree_reject_bang(VALUE self)
 {
     dictcount_t count;
     
-    RETURN_ENUMERATOR(self, 0, NULL);
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
     count = dict_count(DICT(self));
     rbtree_delete_if(self);
     if (count == dict_count(DICT(self)))
@@ -856,9 +988,69 @@ rbtree_reject_bang(VALUE self)
  *
  */
 VALUE
+rbtree_select_bang(VALUE self)
+{
+    dictcount_t count;
+    
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
+    count = dict_count(DICT(self));
+    rbtree_keep_if(self);
+    if (count == dict_count(DICT(self)))
+        return Qnil;
+    return self;
+    
+}
+
+/*********************************************************************/
+
+typedef struct {
+    VALUE result;
+    int if_true;
+} rbtree_select_if_arg_t;
+
+static each_return_t
+select_i(dnode_t* node, void* arg_)
+{
+    VALUE key = GET_KEY(node);
+    VALUE value = GET_VAL(node);
+    rbtree_select_if_arg_t* arg = arg_;
+    
+    if (RTEST(rb_yield_values(2, key, value)) == arg->if_true) {
+        rbtree_aset(arg->result, key, value);
+    }
+    return EACH_NEXT;
+}
+
+static VALUE
+rbtree_select_if(VALUE self, const int if_true)
+{
+    rbtree_select_if_arg_t arg;
+    
+    RETURN_SIZED_ENUMERATOR(self, 0, NULL, rbtree_size);
+    arg.result = rbtree_alloc(CLASS_OF(self));
+    arg.if_true = if_true;
+    rbtree_for_each(self, select_i, &arg);
+    return arg.result;
+}
+
+/*********************************************************************/
+
+/*
+ *
+ */
+VALUE
 rbtree_reject(VALUE self)
 {
-    return rbtree_reject_bang(rb_obj_dup(self));
+    return rbtree_select_if(self, 0);
+}
+
+/*
+ *
+ */
+VALUE
+rbtree_select(VALUE self)
+{
+    return rbtree_select_if(self, 1);
 }
 
 static VALUE
@@ -866,32 +1058,28 @@ rbtree_shift_pop(VALUE self, const int shift)
 {
     dict_t* dict = DICT(self);
     dnode_t* node;
-    VALUE ret;
+    VALUE assoc;
 
     rbtree_modify(self);
 
-    if (dict_isempty(dict)) {
-        if (FL_TEST(self, RBTREE_PROC_DEFAULT)) {
-            return rb_funcall(IFNONE(self), id_call, 2, self, Qnil);
-        }
-        return IFNONE(self);
-    }
-
+    if (dict_isempty(dict))
+        return rb_funcall(self, id_default, 1, Qnil);
+    
     if (shift)
         node = dict_last(dict);
     else
         node = dict_first(dict);
-    ret = ASSOC(node);
+    assoc = ASSOC(node);
     dict_delete_free(dict, node);
-    return ret;
+    return assoc;
 }
 
 /*
  * call-seq:
- *   rbtree.shift => array or object
+ *   rbtree.shift => array or object or nil
  *
- * Removes the first(that is, the smallest) key-value pair and returns
- * it as a two-item array.
+ * Removes the first (that is, the smallest) key-value pair and
+ * returns it.
  */
 VALUE
 rbtree_shift(VALUE self)
@@ -901,10 +1089,10 @@ rbtree_shift(VALUE self)
 
 /*
  * call-seq:
- *   rbtree.pop => array or object
+ *   rbtree.pop => array or object or nil
  *
- * Removes the last(that is, the biggest) key-value pair and returns
- * it as a two-item array.
+ * Removes the last (that is, the greatest) key-value pair and returns
+ * it.
  */
 VALUE
 rbtree_pop(VALUE self)
@@ -955,8 +1143,8 @@ rbtree_update(VALUE self, VALUE other)
         return self;
     if (!rb_obj_is_kind_of(other, CLASS_OF(self))) {
         rb_raise(rb_eTypeError, "wrong argument type %s (expected %s)",
-                 rb_class2name(CLASS_OF(other)),
-                 rb_class2name(CLASS_OF(self)));
+                 rb_obj_classname(other),
+                 rb_obj_classname(self));
     }
     
     if (rb_block_given_p())
@@ -979,17 +1167,36 @@ rbtree_merge(VALUE self, VALUE other)
  *
  */
 VALUE
+rbtree_flatten(int argc, VALUE* argv, VALUE self)
+{
+    VALUE ary;
+    VALUE level;
+    
+    ary = rbtree_to_a(self);
+    if (argc == 0) {
+        argc = 1;
+        level = INT2FIX(1);
+        argv = &level;
+    }
+    rb_funcall2(ary, id_flatten_bang, argc, argv);
+    return ary;
+}
+
+/*
+ *
+ */
+VALUE
 rbtree_has_key(VALUE self, VALUE key)
 {
     return dict_lookup(DICT(self), TO_KEY(key)) == NULL ? Qfalse : Qtrue;
 }
 
 static each_return_t
-has_value_i(dnode_t* node, void* arg_)
+has_value_i(dnode_t* node, void* args_)
 {
-    VALUE* arg = (VALUE*)arg_;
-    if (rb_equal(GET_VAL(node), arg[1])) {
-        arg[0] = Qtrue;
+    VALUE* args = (VALUE*)args_;
+    if (rb_equal(GET_VAL(node), args[1])) {
+        args[0] = Qtrue;
         return EACH_STOP;
     }
     return EACH_NEXT;
@@ -1001,11 +1208,11 @@ has_value_i(dnode_t* node, void* arg_)
 VALUE
 rbtree_has_value(VALUE self, VALUE value)
 {
-    VALUE arg[2];
-    arg[0] = Qfalse;
-    arg[1] = value;
-    rbtree_for_each(self, has_value_i, (void*)&arg);
-    return arg[0];
+    VALUE args[2];
+    args[0] = Qfalse;
+    args[1] = value;
+    rbtree_for_each(self, has_value_i, &args);
+    return args[0];
 }
 
 static each_return_t
@@ -1021,7 +1228,7 @@ keys_i(dnode_t* node, void* ary)
 VALUE
 rbtree_keys(VALUE self)
 {
-    VALUE ary = rb_ary_new();
+    VALUE ary = rb_ary_new2(dict_count(DICT(self)));
     rbtree_for_each(self, keys_i, (void*)ary);
     return ary;
 }
@@ -1039,9 +1246,9 @@ values_i(dnode_t* node, void* ary)
 VALUE
 rbtree_values(VALUE self)
 {
-    VALUE ret = rb_ary_new();
-    rbtree_for_each(self, values_i, (void*)ret);
-    return ret;
+    VALUE ary = rb_ary_new2(dict_count(DICT(self)));
+    rbtree_for_each(self, values_i, (void*)ary);
+    return ary;
 }
 
 static each_return_t
@@ -1057,7 +1264,7 @@ to_a_i(dnode_t* node, void* ary)
 VALUE
 rbtree_to_a(VALUE self)
 {
-    VALUE ary = rb_ary_new();
+    VALUE ary = rb_ary_new2(dict_count(DICT(self)));
     rbtree_for_each(self, to_a_i, (void*)ary);
     OBJ_INFECT(ary, self);
     return ary;
@@ -1066,7 +1273,7 @@ rbtree_to_a(VALUE self)
 static each_return_t
 to_hash_i(dnode_t* node, void* hash)
 {
-    st_insert(RHASH_TBL((long)hash), GET_KEY(node), GET_VAL(node));
+    rb_hash_aset((VALUE)hash, GET_KEY(node), GET_VAL(node));
     return EACH_NEXT;
 }
 
@@ -1077,9 +1284,8 @@ VALUE
 rbtree_to_hash(VALUE self)
 {
     VALUE hash;
-    if (CLASS_OF(self) == MultiRBTree) {
+    if (!rb_obj_is_kind_of(self, RBTree))
         rb_raise(rb_eTypeError, "can't convert MultiRBTree to Hash");
-    }
     
     hash = rb_hash_new();
     rbtree_for_each(self, to_hash_i, (void*)hash);
@@ -1102,95 +1308,63 @@ rbtree_to_rbtree(VALUE self)
 static VALUE
 rbtree_begin_inspect(VALUE self)
 {
-    const char* c = rb_class2name(CLASS_OF(self));
-    VALUE rb_str = rb_str_new(0, strlen(c) + 4);
-    sprintf(RSTRING_PTR(rb_str), "#<%s: ", c);
-    return rb_str;
-}
-
-static VALUE
-to_s_rbtree(VALUE self, VALUE nil)
-{
-    return rb_ary_to_s(rbtree_to_a(self));
-}
-
-#ifdef HAVE_RB_EXEC_RECURSIVE
-VALUE
-rbtree_to_s_recursive(VALUE self, VALUE arg, int recursive)
-{
-    if (recursive)
-        rb_str_cat2(rbtree_begin_inspect(self), "...>");
-    return to_s_rbtree(self, Qnil);
-}
-#endif
-
-/*
- *
- */
-VALUE
-rbtree_to_s(VALUE self)
-{
-#ifdef HAVE_RB_EXEC_RECURSIVE
-    return rb_exec_recursive(rbtree_to_s_recursive, self, Qnil);
-#else
-    if (rb_inspecting_p(self))
- return rb_str_cat2(rbtree_begin_inspect(self), "...>");
-    return rb_protect_inspect(to_s_rbtree, self, Qnil);
-#endif
+    volatile VALUE class_name = rb_class_name(CLASS_OF(self));
+    VALUE str = rb_str_new(NULL, RSTRING_LEN(class_name) + 4);
+    sprintf(RSTRING_PTR(str), "#<%s: ", RSTRING_PTR(class_name));
+    return str;
 }
 
 static each_return_t
-inspect_i(dnode_t* node, void* ret_)
+inspect_i(dnode_t* node, void* result_)
 {
-    VALUE ret = (VALUE)ret_;
+    VALUE result = (VALUE)result_;
     VALUE str;
 
-    if (RSTRING_PTR(ret)[0] == '-')
-        RSTRING_PTR(ret)[0] = '#';
+    if (RSTRING_PTR(result)[0] == '-')
+        RSTRING_PTR(result)[0] = '#';
     else
-        rb_str_cat2(ret, ", ");
+        rb_str_cat2(result, ", ");
 
     str = rb_inspect(GET_KEY(node));
-    rb_str_append(ret, str);
-    OBJ_INFECT(ret, str);
+    rb_str_append(result, str);
+    OBJ_INFECT(result, str);
 
-    rb_str_cat2(ret, "=>");
+    rb_str_cat2(result, "=>");
 
     str = rb_inspect(GET_VAL(node));
-    rb_str_append(ret, str);
-    OBJ_INFECT(ret, str);
+    rb_str_append(result, str);
+    OBJ_INFECT(result, str);
 
     return EACH_NEXT;
 }
 
 static VALUE
-inspect_rbtree(VALUE self, VALUE ret)
+inspect_rbtree(VALUE self, VALUE result)
 {
     VALUE str;
     
-    rb_str_cat2(ret, "{");
-    RSTRING_PTR(ret)[0] = '-';
-    rbtree_for_each(self, inspect_i, (void*)ret);
-    RSTRING_PTR(ret)[0] = '#';
-    rb_str_cat2(ret, "}");
+    rb_str_cat2(result, "{");
+    RSTRING_PTR(result)[0] = '-';
+    rbtree_for_each(self, inspect_i, (void*)result);
+    RSTRING_PTR(result)[0] = '#';
+    rb_str_cat2(result, "}");
 
     str = rb_inspect(IFNONE(self));
-    rb_str_cat2(ret, ", default=");
-    rb_str_append(ret, str);
-    OBJ_INFECT(ret, str);
+    rb_str_cat2(result, ", default=");
+    rb_str_append(result, str);
+    OBJ_INFECT(result, str);
     
-    str = rb_inspect((VALUE)CONTEXT(self));
-    rb_str_cat2(ret, ", cmp_proc=");
-    rb_str_append(ret, str);
-    OBJ_INFECT(ret, str);
+    str = rb_inspect(CMP_PROC(self));
+    rb_str_cat2(result, ", cmp_proc=");
+    rb_str_append(result, str);
+    OBJ_INFECT(result, str);
 
-    rb_str_cat2(ret, ">");
-    OBJ_INFECT(ret, self);
-    return ret;
+    rb_str_cat2(result, ">");
+    OBJ_INFECT(result, self);
+    return result;
 }
 
-#ifdef HAVE_RB_EXEC_RECURSIVE
-VALUE
+static VALUE
 rbtree_inspect_recursive(VALUE self, VALUE arg, int recursive)
 {
     VALUE str = rbtree_begin_inspect(self);
@@ -1198,7 +1372,6 @@ rbtree_inspect_recursive(VALUE self, VALUE arg, int recursive)
         return rb_str_cat2(str, "...>");
     return inspect_rbtree(self, str);
 }
-#endif
 
 /*
  *
@@ -1218,11 +1391,20 @@ rbtree_inspect(VALUE self)
 
 /*
  * call-seq:
- *   rbtree.lower_bound(key) => array
+ *   rbtree.lower_bound(key) => array or nil
  *
- * Retruns key-value pair corresponding to the lowest key that is
- * equal to or greater than the given key(inside of lower
+ * Retruns the key-value pair corresponding to the lowest key that is
+ * equal to or greater than the given key (inside the lower
  * boundary). If there is no such key, returns nil.
+ *
+ *   rbtree = RBTree["az", 10, "ba", 20]
+ *   rbtree.lower_bound("ba") # => ["ba", 20]
+ *
+ *   # "ba" is the lowest key that is greater than "b"
+ *   rbtree.lower_bound("b") # => ["ba", 20]
+ *
+ *   # no key that is equal to or greater than "c"
+ *   rbtree.lower_bound("c") # => nil
  */
 VALUE
 rbtree_lower_bound(VALUE self, VALUE key)
@@ -1235,11 +1417,20 @@ rbtree_lower_bound(VALUE self, VALUE key)
 
 /*
  * call-seq:
- *   rbtree.upper_bound(key) => array
+ *   rbtree.upper_bound(key) => array or nil
  *
- * Retruns key-value pair corresponding to the greatest key that is
- * equal to or lower than the given key(inside of upper boundary). If
- * there is no such key, returns nil.
+ * Retruns the key-value pair corresponding to the greatest key that
+ * is equal to or lower than the given key (inside the upper
+ * boundary). If there is no such key, returns nil.
+ *
+ *   rbtree = RBTree["az", 10, "ba", 20]
+ *   rbtree.upper_bound("ba") # => ["ba", 20]
+ *
+ *   # "az" is the greatest key that is lower than "b"
+ *   rbtree.upper_bound("b") # => ["az", 10]
+ *
+ *   # no key that is equal to or lower than "a"
+ *   rbtree.upper_bound("a") # => nil
  */
 VALUE
 rbtree_upper_bound(VALUE self, VALUE key)
@@ -1256,7 +1447,7 @@ typedef struct {
     VALUE self;
     dnode_t* lower_node;
     dnode_t* upper_node;
-    VALUE ret;
+    VALUE result;
 } rbtree_bound_arg_t;
 
 static VALUE
@@ -1267,33 +1458,75 @@ rbtree_bound_body(rbtree_bound_arg_t* arg)
     dnode_t* lower_node = arg->lower_node;
     dnode_t* upper_node = arg->upper_node;
     const int block_given = rb_block_given_p();
-    VALUE ret = arg->ret;
+    VALUE result = arg->result;
     dnode_t* node;
 
     ITER_LEV(self)++;
-    for (node = lower_node;;
+    for (node = lower_node;
+         node != NULL;
          node = dict_next(dict, node)) {
 
         if (block_given)
             rb_yield_values(2, GET_KEY(node), GET_VAL(node));
         else
-            rb_ary_push(ret, ASSOC(node));
+            rb_ary_push(result, ASSOC(node));
         if (node == upper_node)
             break;
     }
-    return ret;
+    return result;
 }
+
+#ifdef HAVE_SIZED_ENUMERATOR
+static VALUE
+rbtree_bound_size(VALUE self, VALUE args)
+{
+    VALUE key1 = RARRAY_PTR(args)[0];
+    VALUE key2 = RARRAY_PTR(args)[RARRAY_LEN(args) - 1];
+    dnode_t* lower_node = dict_lower_bound(DICT(self), TO_KEY(key1));
+    dnode_t* upper_node = dict_upper_bound(DICT(self), TO_KEY(key2));
+    dictcount_t count = 0;
+    dnode_t* node;
+    
+    if (lower_node == NULL || upper_node == NULL ||
+        DICT(self)->dict_compare(dnode_getkey(lower_node),
+                                 dnode_getkey(upper_node),
+                                 DICT(self)->dict_context) > 0) {
+        return INT2FIX(0);
+    }
+    
+    for (node = lower_node;
+         node != NULL;
+         node = dict_next(DICT(self), node)) {
+        
+        count++;
+        if (node == upper_node) {
+            break;
+        }
+    }
+    return ULONG2NUM(count);
+}
+#endif
 
 /*********************************************************************/
 
 /*
  * call-seq:
- *   rbtree.bound(key1, key2 = key1)                      => array
  *   rbtree.bound(key1, key2 = key1) {|key, value| block} => rbtree
+ *   rbtree.bound(key1, key2 = key1)                      => enumerator
  *
- * Returns an array containing key-value pairs between the result of
- * MultiRBTree#lower_bound and MultiRBTree#upper_bound. If a block is
- * given it calls the block once for each pair.
+ * Calls block once for each key between the result of
+ * rbtree.lower_bound(key1) and rbtree.upper_bound(key2) in order,
+ * passing the key-value pair as parameters. If the lower bound
+ * exceeds the upper bound, block is not called.
+ *
+ * Returns an enumerator if no block is given.
+ *
+ *   mrbtree = MultiRBTree["az", 10, "ba", 20, "ba", 30, "bz", 40]
+ *   mrbtree.bound("ba").to_a # => [["ba", 20], ["ba", 30]]
+ *   mrbtree.bound("b", "c").to_a # => [["ba", 20], ["ba", 30], ["bz", 40]]
+ *   
+ *   # the lower bound ("ba") exceeds the upper bound ("az")
+ *   mrbtree.bound("b").to_a # => []
  */
 VALUE
 rbtree_bound(int argc, VALUE* argv, VALUE self)
@@ -1301,27 +1534,29 @@ rbtree_bound(int argc, VALUE* argv, VALUE self)
     dict_t* dict = DICT(self);
     dnode_t* lower_node;
     dnode_t* upper_node;
-    VALUE ret;
+    VALUE result;
     
-    if (argc == 0 || argc > 2)
-        rbtree_argc_error();
+    if (argc == 0 || argc > 2) {
+        rbtree_argc_error(argc, 1, 2);
+    }
+    
+    RETURN_SIZED_ENUMERATOR(self, argc, argv, rbtree_bound_size);
     
     lower_node = dict_lower_bound(dict, TO_KEY(argv[0]));
     upper_node = dict_upper_bound(dict, TO_KEY(argv[argc - 1]));
-    ret = rb_block_given_p() ? self : rb_ary_new();
+    result = rb_block_given_p() ? self : rb_ary_new();
     
     if (lower_node == NULL || upper_node == NULL ||
-        COMPARE(self)(dnode_getkey(lower_node),
-                      dnode_getkey(upper_node),
-                      CONTEXT(self)) > 0) {
-        return ret;
+        DICT(self)->dict_compare(dnode_getkey(lower_node),
+                                 dnode_getkey(upper_node),
+                                 DICT(self)->dict_context) > 0) {
+        return result;
     } else {
         rbtree_bound_arg_t arg;
         arg.self = self;
         arg.lower_node = lower_node;
         arg.upper_node = upper_node;
-        arg.ret = ret;
-
+        arg.result = result;
         return rb_ensure(rbtree_bound_body, (VALUE)&arg,
                          rbtree_each_ensure, self);
     }
@@ -1333,12 +1568,8 @@ rbtree_first_last(VALUE self, const int first)
     dict_t* dict = DICT(self);
     dnode_t* node;
 
-    if (dict_isempty(dict)) {
-        if (FL_TEST(self, RBTREE_PROC_DEFAULT)) {
-            return rb_funcall(IFNONE(self), id_call, 2, self, Qnil);
-        }
-        return IFNONE(self);
-    }
+    if (dict_isempty(dict))
+        return rb_funcall(self, id_default, 1, Qnil);
     
     if (first)
         node = dict_first(dict);
@@ -1349,9 +1580,9 @@ rbtree_first_last(VALUE self, const int first)
 
 /*
  * call-seq:
- *   rbtree.first => array or object
+ *   rbtree.first => array or object or nil
  *
- * Returns the first(that is, the smallest) key-value pair.
+ * Returns the first (that is, the smallest) key-value pair.
  */
 VALUE
 rbtree_first(VALUE self)
@@ -1361,9 +1592,9 @@ rbtree_first(VALUE self)
 
 /*
  * call-seq:
- *   rbtree.last => array of object
+ *   rbtree.last => array or object or nil
  *
- * Returns the last(that is, the biggest) key-value pair.
+ * Returns the last (that is, the greatest) key-value pair.
  */
 VALUE
 rbtree_last(VALUE self)
@@ -1379,170 +1610,258 @@ rbtree_last(VALUE self)
  *   rbtree.readjust {|key1, key2| block} => rbtree
  *
  * Sets a proc to compare keys and readjusts elements using the given
- * block or a Proc object given as the argument. The block takes two
- * arguments of a key and returns negative, 0, or positive depending
- * on the first argument is less than, equal to, or greater than the
- * second one. If no block is given it just readjusts elements using
- * current comparison block. If nil is given as the argument it sets
- * default comparison block.
+ * block or a Proc object given as an argument. The block takes two
+ * keys and returns a negative integer, 0, or a positive integer as
+ * the first argument is less than, equal to, or greater than the
+ * second one. If no block is given, just readjusts elements using the
+ * current comparison block. If nil is given as an argument the
+ * default comparison block that uses the <=> method is set.
+ *
+ *   rbtree = RBTree["a", 10, "b", 20]
+ *   rbtree.readjust {|a, b| b <=> a }
+ *   rbtree.first # => ["b", 20]
+ *   
+ *   rbtree.readjust(nil)
+ *   rbtree.first # => ["a", 10]
  */
 VALUE
 rbtree_readjust(int argc, VALUE* argv, VALUE self)
 {
-    dict_comp_t cmp = NULL;
-    void* context = NULL;
+    dict_comp_t cmp_func = NULL;
+    VALUE cmp_proc = Qnil;
     
     rbtree_modify(self);
 
-    if (argc == 0) {
-        if (rb_block_given_p()) {
-            cmp = rbtree_user_cmp;
-            context = (void*)rb_block_proc();
-        } else {
-            cmp = COMPARE(self);
-            context = CONTEXT(self);
+    if (rb_block_given_p()) {
+        if (argc != 0) {
+            rbtree_argc_error(argc, 0, 0);
         }
-    } else if (argc == 1 && !rb_block_given_p()) {
-        if (argv[0] == Qnil) {
-            cmp = rbtree_cmp;
-            context = (void*)Qnil;
-        } else {
-            if (CLASS_OF(argv[0]) != rb_cProc)
-                rb_raise(rb_eTypeError,
-                         "wrong argument type %s (expected Proc)",
-                         rb_class2name(CLASS_OF(argv[0])));
-            cmp = rbtree_user_cmp;
-            context = (void*)argv[0];
-        }
+        cmp_func = rbtree_user_cmp;
+        cmp_proc = rb_block_proc();
+        rbtree_check_proc_arity(cmp_proc, 2);
     } else {
-        rbtree_argc_error();
+        if (argc == 0) {
+            cmp_func = DICT(self)->dict_compare;
+            cmp_proc = CMP_PROC(self);
+        } else if (argc == 1) {
+            if (NIL_P(argv[0])) {
+                cmp_func = rbtree_cmp;
+                cmp_proc = Qnil;
+            } else {
+                VALUE proc = rb_check_convert_type(argv[0], T_DATA, "Proc", "to_proc");
+                if (NIL_P(proc)) {
+                    rb_raise(rb_eTypeError,
+                             "wrong cmp_proc type %s (expected Proc)",
+                             rb_obj_classname(argv[0]));
+                }
+                cmp_func = rbtree_user_cmp;
+                cmp_proc = proc;
+                rbtree_check_proc_arity(cmp_proc, 2);
+            }
+        } else {
+            rbtree_argc_error(argc, 0, 1);
+        }
     }
 
     if (dict_isempty(DICT(self))) {
-        COMPARE(self) = cmp;
-        CONTEXT(self) = context;
+        DICT(self)->dict_compare = cmp_func;
+        CMP_PROC(self) = cmp_proc;
         return self;
     }
-    copy_dict(self, self, cmp, context);
+    copy_dict(self, self, cmp_func, cmp_proc);
     return self;
 }
 
 /*
  * call-seq:
- *   rbtree.cmp_proc => proc
+ *   rbtree.cmp_proc => proc or nil
  *
- * Returns the comparison block that is given by MultiRBTree#readjust.
+ * Returns the comparison block that is set by
+ * MultiRBTree#readjust. If the default comparison block is set,
+ * returns nil.
  */
 VALUE
 rbtree_cmp_proc(VALUE self)
 {
-    return (VALUE)(CONTEXT(self));
+    return CMP_PROC(self);
 }
 
 /*********************************************************************/
 
+static ID id_breakable;
 static ID id_comma_breakable;
+static ID id_group;
 static ID id_object_group;
 static ID id_pp;
-static ID id_pp_hash;
 static ID id_text;
 
+static VALUE
+pp_group(VALUE args_)
+{
+    VALUE* args = (VALUE*)args_;
+    return rb_funcall(args[0], id_group, 3, args[1], args[2], args[3]);
+}
+
 typedef struct {
-    VALUE rbtree;
     VALUE pp;
-} pp_arg_t;
+    dnode_t* node;
+} pp_pair_arg_t;
 
 static VALUE
-pp_object_group(VALUE arg_)
+pp_value(VALUE nil, pp_pair_arg_t* pair_arg)
 {
-    pp_arg_t* arg = (pp_arg_t*)arg_;
-    return rb_funcall(arg->pp, id_object_group, 1, arg->rbtree);
+    VALUE pp = pair_arg->pp;
+    rb_funcall(pp, id_breakable, 1, rb_str_new(NULL, 0));
+    return rb_funcall(pp, id_pp, 1, GET_VAL(pair_arg->node));
 }
 
 static VALUE
-pp_block(VALUE nil, pp_arg_t* arg)
+pp_pair(VALUE nil, pp_pair_arg_t* pair_arg)
 {
-    VALUE pp = arg->pp;
-    VALUE rbtree = arg->rbtree;
+    VALUE pp = pair_arg->pp;
+    VALUE group_args[4];
+    group_args[0] = pp;
+    group_args[1] = INT2FIX(1);
+    group_args[2] = rb_str_new(NULL, 0);
+    group_args[3] = rb_str_new(NULL, 0);
+    
+    rb_funcall(pp, id_pp, 1, GET_KEY(pair_arg->node));
+    rb_funcall(pp, id_text, 1, rb_str_new2("=>"));
+    return rb_iterate(pp_group, (VALUE)&group_args, pp_value, (VALUE)pair_arg);
+}
 
+typedef struct {
+    VALUE pp;
+    int first;
+} pp_each_pair_arg_t;
+
+static each_return_t
+pp_each_pair_i(dnode_t* node, void* each_pair_arg_)
+{
+    pp_each_pair_arg_t* each_pair_arg = (pp_each_pair_arg_t*)each_pair_arg_;
+    VALUE group_args[4];
+    pp_pair_arg_t pair_arg;
+    
+    if (each_pair_arg->first) {
+        each_pair_arg->first = 0;
+    } else {
+        rb_funcall(each_pair_arg->pp, id_comma_breakable, 0);
+    }
+    
+    group_args[0] = each_pair_arg->pp;
+    group_args[1] = INT2FIX(0);
+    group_args[2] = rb_str_new(NULL, 0);
+    group_args[3] = rb_str_new(NULL, 0);
+    
+    pair_arg.pp = each_pair_arg->pp;
+    pair_arg.node = node;
+    
+    rb_iterate(pp_group, (VALUE)&group_args, pp_pair, (VALUE)&pair_arg);
+    return EACH_NEXT;
+}
+
+typedef struct {
+    VALUE pp;
+    VALUE rbtree;
+} pp_rbtree_arg_t;
+
+static VALUE
+pp_each_pair(VALUE nil, pp_rbtree_arg_t* rbtree_arg)
+{
+    pp_each_pair_arg_t each_pair_arg;
+    each_pair_arg.pp = rbtree_arg->pp;
+    each_pair_arg.first = 1;
+    return rbtree_for_each(rbtree_arg->rbtree, pp_each_pair_i, &each_pair_arg);
+}
+
+static VALUE
+pp_rbtree(VALUE nil, pp_rbtree_arg_t* rbtree_arg)
+{
+    VALUE pp = rbtree_arg->pp;
+    VALUE rbtree = rbtree_arg->rbtree;
+    
+    VALUE group_args[4];
+    group_args[0] = pp;
+    group_args[1] = INT2FIX(1);
+    group_args[2] = rb_str_new2("{");
+    group_args[3] = rb_str_new2("}");
+    
     rb_funcall(pp, id_text, 1, rb_str_new2(": "));
-    rb_funcall(pp, id_pp_hash, 1, rbtree);
+    rb_iterate(pp_group, (VALUE)&group_args, pp_each_pair, (VALUE)rbtree_arg);
     rb_funcall(pp, id_comma_breakable, 0);
     rb_funcall(pp, id_text, 1, rb_str_new2("default="));
     rb_funcall(pp, id_pp, 1, IFNONE(rbtree));
     rb_funcall(pp, id_comma_breakable, 0);
     rb_funcall(pp, id_text, 1, rb_str_new2("cmp_proc="));
-    rb_funcall(pp, id_pp, 1, CONTEXT(rbtree));
-    return pp;
+    return rb_funcall(pp, id_pp, 1, CMP_PROC(rbtree));
+}
+
+static VALUE
+pp_rbtree_group(VALUE arg_)
+{
+    pp_rbtree_arg_t* arg = (pp_rbtree_arg_t*)arg_;
+    return rb_funcall(arg->pp, id_object_group, 1, arg->rbtree);
 }
 
 /*********************************************************************/
 
-/*
- * Called by pretty printing function pp.
+/* :nodoc:
+ *
  */
 VALUE
 rbtree_pretty_print(VALUE self, VALUE pp)
 {
-    pp_arg_t pp_arg;
-    pp_arg.rbtree = self;
-    pp_arg.pp = pp;
-
-    return rb_iterate(pp_object_group, (VALUE)&pp_arg,
-                      pp_block, (VALUE)&pp_arg);
+    pp_rbtree_arg_t arg;
+    arg.rbtree = self;
+    arg.pp = pp;
+    return rb_iterate(pp_rbtree_group, (VALUE)&arg, pp_rbtree, (VALUE)&arg);
 }
 
-/*
- * Called by pretty printing function pp.
+/* :nodoc:
+ *
  */
 VALUE
 rbtree_pretty_print_cycle(VALUE self, VALUE pp)
 {
-#ifdef HAVE_RB_EXEC_RECURSIVE
     return rb_funcall(pp, id_pp, 1, rbtree_inspect_recursive(self, Qnil, 1));
-#else
-    return rb_funcall(pp, id_pp, 1, rbtree_inspect(self));
-#endif
 }
 
 /*********************************************************************/
 
 static each_return_t
-to_flatten_ary_i(dnode_t* node, void* ary)
+to_flat_ary_i(dnode_t* node, void* ary)
 {
     rb_ary_push((VALUE)ary, GET_KEY(node));
     rb_ary_push((VALUE)ary, GET_VAL(node));
     return EACH_NEXT;
 }
 
-/*********************************************************************/
-
-/*
- * Called by Marshal.dump.
+/* :nodoc:
+ *
  */
 VALUE
 rbtree_dump(VALUE self, VALUE limit)
 {
     VALUE ary;
-    VALUE ret;
+    VALUE result;
     
     if (FL_TEST(self, RBTREE_PROC_DEFAULT))
-        rb_raise(rb_eTypeError, "cannot dump rbtree with default proc");
-    if ((VALUE)CONTEXT(self) != Qnil)
-        rb_raise(rb_eTypeError, "cannot dump rbtree with compare proc");
+        rb_raise(rb_eTypeError, "can't dump rbtree with default proc");
+    if (CMP_PROC(self) != Qnil)
+        rb_raise(rb_eTypeError, "can't dump rbtree with comparison proc");
     
     ary = rb_ary_new2(dict_count(DICT(self)) * 2 + 1);
-    rbtree_for_each(self, to_flatten_ary_i, (void*)ary);
+    rbtree_for_each(self, to_flat_ary_i, (void*)ary);
     rb_ary_push(ary, IFNONE(self));
 
-    ret = rb_marshal_dump(ary, limit);
+    result = rb_marshal_dump(ary, limit);
     rb_ary_clear(ary);
     rb_gc_force_recycle(ary);
-    return ret;
+    return result;
 }
 
-/*
- * Called by Marshal.load.
+/* :nodoc:
+ *
  */
 VALUE
 rbtree_s_load(VALUE klass, VALUE str)
@@ -1565,56 +1884,13 @@ rbtree_s_load(VALUE klass, VALUE str)
 /*********************************************************************/
 
 /*
- * RBTree is a sorted associative collection that is implemented with
- * Red-Black Tree. The elements of RBTree are ordered and its interface
- * is the almost same as Hash, so simply you can consider RBTree sorted
- * Hash.
+ * Document-class: MultiRBTree
  *
- * Red-Black Tree is a kind of binary tree that automatically balances
- * by itself when a node is inserted or deleted. Thus the complexity
- * for insert, search and delete is O(log N) in expected and worst
- * case. On the other hand the complexity of Hash is O(1). Because
- * Hash is unordered the data structure is more effective than
- * Red-Black Tree as an associative collection.
- * 
- * The elements of RBTree are sorted with natural ordering (by <=>
- * method) of its keys or by a comparator(Proc) set by readjust
- * method. It means all keys in RBTree should be comparable with each
- * other. Or a comparator that takes two arguments of a key should return
- * negative, 0, or positive depending on the first argument is less than,
- * equal to, or greater than the second one.
- * 
- * The interface of RBTree is the almost same as Hash and there are a
- * few methods to take advantage of the ordering:
- * 
- * * lower_bound, upper_bound, bound
- * * first, last
- * * shift, pop
- * * reverse_each
- * 
- * Note: while iterating RBTree (e.g. in a block of each method), it is
- * not modifiable, or TypeError is thrown.
- * 
- * RBTree supoorts pretty printing using pp.
- * 
- * This library contains two classes. One is RBTree and the other is
- * MultiRBTree that is a parent class of RBTree. RBTree does not allow
- * duplications of keys but MultiRBTree does.
- *
- *   require "rbtree"
- *   
- *   rbtree = RBTree["c", 10, "a", 20]
- *   rbtree["b"] = 30
- *   p rbtree["b"]              # => 30
- *   rbtree.each do |k, v|
- *     p [k, v]
- *   end                        # => ["a", 20] ["b", 30] ["c", 10]
- *   
- *   mrbtree = MultiRBTree["c", 10, "a", 20, "e", 30, "a", 40]
- *   p mrbtree.lower_bound("b") # => ["c", 10]
- *   mrbtree.bound("a", "d") do |k, v|
- *     p [k, v]
- *   end                        # => ["a", 20] ["a", 40] ["c", 10]
+ * A sorted associative collection that can contain duplicate keys.
+ */
+/*
+ * A sorted associative collection that cannot contain duplicate
+ * keys. RBTree is a subclass of MultiRBTree.
  */
 void Init_rbtree()
 {
@@ -1631,10 +1907,11 @@ void Init_rbtree()
     rb_define_method(MultiRBTree, "initialize_copy", rbtree_initialize_copy, 1);
 
     rb_define_method(MultiRBTree, "to_a", rbtree_to_a, 0);
-    rb_define_method(MultiRBTree, "to_s", rbtree_to_s, 0);
+    rb_define_method(MultiRBTree, "to_h", rbtree_to_hash, 0);
     rb_define_method(MultiRBTree, "to_hash", rbtree_to_hash, 0);
     rb_define_method(MultiRBTree, "to_rbtree", rbtree_to_rbtree, 0);
     rb_define_method(MultiRBTree, "inspect", rbtree_inspect, 0);
+    rb_define_alias(MultiRBTree, "to_s", "inspect");
 
     rb_define_method(MultiRBTree, "==", rbtree_equal, 1);
     rb_define_method(MultiRBTree, "[]", rbtree_aref, 1);
@@ -1649,12 +1926,14 @@ void Init_rbtree()
     rb_define_method(MultiRBTree, "default", rbtree_default, -1);
     rb_define_method(MultiRBTree, "default=", rbtree_set_default, 1);
     rb_define_method(MultiRBTree, "default_proc", rbtree_default_proc, 0);
+    rb_define_method(MultiRBTree, "default_proc=", rbtree_set_default_proc, 1);
+    rb_define_method(MultiRBTree, "key", rbtree_key, 1);
     rb_define_method(MultiRBTree, "index", rbtree_index, 1);
     rb_define_method(MultiRBTree, "empty?", rbtree_empty_p, 0);
     rb_define_method(MultiRBTree, "size", rbtree_size, 0);
     rb_define_method(MultiRBTree, "length", rbtree_size, 0);
 
-    rb_define_method(MultiRBTree, "each", rbtree_each, 0);
+    rb_define_method(MultiRBTree, "each", rbtree_each_pair, 0);
     rb_define_method(MultiRBTree, "each_value", rbtree_each_value, 0);
     rb_define_method(MultiRBTree, "each_key", rbtree_each_key, 0);
     rb_define_method(MultiRBTree, "each_pair", rbtree_each_pair, 0);
@@ -1668,15 +1947,20 @@ void Init_rbtree()
     rb_define_method(MultiRBTree, "pop", rbtree_pop, 0);
     rb_define_method(MultiRBTree, "delete", rbtree_delete, 1);
     rb_define_method(MultiRBTree, "delete_if", rbtree_delete_if, 0);
-    rb_define_method(MultiRBTree, "select", rbtree_select, 0);
+    rb_define_method(MultiRBTree, "keep_if", rbtree_keep_if, 0);
     rb_define_method(MultiRBTree, "reject", rbtree_reject, 0);
     rb_define_method(MultiRBTree, "reject!", rbtree_reject_bang, 0);
+    rb_define_method(MultiRBTree, "select", rbtree_select, 0);
+    rb_define_method(MultiRBTree, "select!", rbtree_select_bang, 0);
     rb_define_method(MultiRBTree, "clear", rbtree_clear, 0);
     rb_define_method(MultiRBTree, "invert", rbtree_invert, 0);
     rb_define_method(MultiRBTree, "update", rbtree_update, 1);
     rb_define_method(MultiRBTree, "merge!", rbtree_update, 1);
     rb_define_method(MultiRBTree, "merge", rbtree_merge, 1);
     rb_define_method(MultiRBTree, "replace", rbtree_initialize_copy, 1);
+#ifdef HAVE_HASH_FLATTEN
+    rb_define_method(MultiRBTree, "flatten", rbtree_flatten, -1);
+#endif
 
     rb_define_method(MultiRBTree, "include?", rbtree_has_key, 1);
     rb_define_method(MultiRBTree, "member?", rbtree_has_key, 1);
@@ -1691,19 +1975,19 @@ void Init_rbtree()
     rb_define_method(MultiRBTree, "_dump", rbtree_dump, 1);
     rb_define_singleton_method(MultiRBTree, "_load", rbtree_s_load, 1);
     
-    id_bound = rb_intern("bound");
     id_cmp = rb_intern("<=>");
     id_call = rb_intern("call");
     id_default = rb_intern("default");
-
+    id_flatten_bang = rb_intern("flatten!");
 
     rb_define_method(MultiRBTree, "pretty_print", rbtree_pretty_print, 1);
     rb_define_method(MultiRBTree,
                      "pretty_print_cycle", rbtree_pretty_print_cycle, 1);
 
+    id_breakable = rb_intern("breakable");
     id_comma_breakable = rb_intern("comma_breakable");
+    id_group = rb_intern("group");
     id_object_group = rb_intern("object_group");
-    id_pp_hash = rb_intern("pp_hash");
-    id_text = rb_intern("text");
     id_pp = rb_intern("pp");
+    id_text = rb_intern("text");
 }

@@ -25,9 +25,8 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <assert.h>
+#define DICT_IMPLEMENTATION
 #include "dict.h"
-
-#include <ruby.h>
 
 #ifdef KAZLIB_RCSID
 static const char rcsid[] = "$Id: dict.c,v 1.15 2005/10/06 05:16:35 kuma Exp $";
@@ -65,8 +64,6 @@ static const char rcsid[] = "$Id: dict.c,v 1.15 2005/10/06 05:16:35 kuma Exp $";
 #define dict_root(D) ((D)->nilnode.left)
 #define dict_nil(D) (&(D)->nilnode)
 #define DICT_DEPTH_MAX 64
-
-#define COMPARE(dict, key1, key2) dict->compare(key1, key2, dict->context)
 
 static dnode_t *dnode_alloc(void *context);
 static void dnode_free(dnode_t *node, void *context);
@@ -158,17 +155,17 @@ static int verify_bintree(dict_t *dict)
     first = dict_first(dict);
 
     if (dict->dupes) {
-        while (first && (next = dict_next(dict, first))) {
-            if (COMPARE(dict, first->key, next->key) > 0)
-                return 0;
-            first = next;
-        }
+	while (first && (next = dict_next(dict, first))) {
+	    if (dict->compare(first->key, next->key, dict->context) > 0)
+		return 0;
+	    first = next;
+	}
     } else {
-        while (first && (next = dict_next(dict, first))) {
-            if (COMPARE(dict, first->key, next->key) >= 0)
-                return 0;
-            first = next;
-        }
+	while (first && (next = dict_next(dict, first))) {
+	    if (dict->compare(first->key, next->key, dict->context) >= 0)
+		return 0;
+	    first = next;
+	}
     }
     return 1;
 }
@@ -251,8 +248,8 @@ static int verify_dict_has_node(dnode_t *nil, dnode_t *root, dnode_t *node)
 
 dict_t *dict_create(dict_comp_t comp)
 {
-    dict_t* new = ALLOC(dict_t);
-    
+    dict_t *new = malloc(sizeof *new);
+
     if (new) {
 	new->compare = comp;
 	new->allocnode = dnode_alloc;
@@ -263,7 +260,7 @@ dict_t *dict_create(dict_comp_t comp)
 	new->nilnode.right = &new->nilnode;
 	new->nilnode.parent = &new->nilnode;
 	new->nilnode.color = dnode_black;
-        new->dupes = 0;
+	new->dupes = 0;
     }
     return new;
 }
@@ -291,7 +288,7 @@ void dict_set_allocator(dict_t *dict, dnode_alloc_t al,
 void dict_destroy(dict_t *dict)
 {
     assert (dict_isempty(dict));
-    xfree(dict);
+    free(dict);
 }
 
 /*
@@ -424,9 +421,6 @@ int dict_similar(const dict_t *left, const dict_t *right)
     if (left->context != right->context)
 	return 0;
 
-/*     if (left->dupes != right->dupes) */
-/*         return 0; */
-
     return 1;
 }
 
@@ -447,24 +441,24 @@ dnode_t *dict_lookup(dict_t *dict, const void *key)
     /* simple binary search adapted for trees that contain duplicate keys */
 
     while (root != nil) {
-	result = COMPARE(dict, key, root->key);
+	result = dict->compare(key, root->key, dict->context);
 	if (result < 0)
 	    root = root->left;
 	else if (result > 0)
 	    root = root->right;
 	else {
-            if (!dict->dupes) { /* no duplicates, return match          */
-                return root;
-            } else {            /* could be dupes, find leftmost one    */
-                do {
-                    saved = root;
-                    root = root->left;
-                    while (root != nil && COMPARE(dict, key, root->key))
-                        root = root->right;
-                } while (root != nil);
-                return saved;
-            }
-        }
+	    if (!dict->dupes) {	/* no duplicates, return match		*/
+		return root;
+	    } else {		/* could be dupes, find leftmost one	*/
+		do {
+		    saved = root;
+		    root = root->left;
+		    while (root != nil && dict->compare(key, root->key, dict->context))
+			root = root->right;
+		} while (root != nil);
+		return saved;
+	    }
+	}
     }
 
     return NULL;
@@ -482,21 +476,21 @@ dnode_t *dict_lower_bound(dict_t *dict, const void *key)
     dnode_t *tentative = 0;
 
     while (root != nil) {
-	int result = COMPARE(dict, key, root->key);
-        
+	int result = dict->compare(key, root->key, dict->context);
+
 	if (result > 0) {
 	    root = root->right;
 	} else if (result < 0) {
 	    tentative = root;
 	    root = root->left;
 	} else {
-            if (!dict->dupes) {
-                return root;
-            } else {
-                tentative = root;
-                root = root->left;
-            }
-        }
+	    if (!dict->dupes) {
+	    	return root;
+	    } else {
+		tentative = root;
+		root = root->left;
+	    }
+	} 
     }
     
     return tentative;
@@ -514,7 +508,7 @@ dnode_t *dict_upper_bound(dict_t *dict, const void *key)
     dnode_t *tentative = 0;
 
     while (root != nil) {
-	int result = COMPARE(dict, key, root->key);
+	int result = dict->compare(key, root->key, dict->context);
 
 	if (result < 0) {
 	    root = root->left;
@@ -522,13 +516,13 @@ dnode_t *dict_upper_bound(dict_t *dict, const void *key)
 	    tentative = root;
 	    root = root->right;
 	} else {
-            if (!dict->dupes) {
-                return root;
-            } else {
-                tentative = root;
-                root = root->right;
-            }
-        }
+	    if (!dict->dupes) {
+	    	return root;
+	    } else {
+		tentative = root;
+		root = root->right;
+	    }
+	} 
     }
     
     return tentative;
@@ -555,12 +549,10 @@ int dict_insert(dict_t *dict, dnode_t *node, const void *key)
     assert (!dnode_is_in_a_dict(node));
 
     /* basic binary tree insert */
-    
+
     while (where != nil) {
 	parent = where;
-	result = COMPARE(dict, key, where->key);
-	/* trap attempts at duplicate key insertion unless it's explicitly allowed */
-
+	result = dict->compare(key, where->key, dict->context);
         if (!dict->dupes && result == 0) {
             where->data = node->data;
             return 0;
@@ -928,6 +920,13 @@ void dict_allow_dupes(dict_t *dict)
     dict->dupes = 1;
 }
 
+#undef dict_count
+#undef dict_isempty
+#undef dict_isfull
+#undef dnode_get
+#undef dnode_put
+#undef dnode_getkey
+
 dictcount_t dict_count(dict_t *dict)
 {
     return dict->nodecount;
@@ -1036,16 +1035,16 @@ void dict_load_next(dict_load_t *load, dnode_t *newnode, const void *key)
 {
     dict_t *dict = load->dictptr;
     dnode_t *nil = &load->nilnode;
-    
+   
     assert (!dnode_is_in_a_dict(newnode));
     assert (dict->nodecount < DICTCOUNT_T_MAX);
 
     #ifndef NDEBUG
     if (dict->nodecount > 0) {
-        if (dict->dupes)
-            assert (COMPARE(dict, nil->left->key, key) <= 0);
-        else
-            assert (COMPARE(dict, nil->left->key, key) < 0);
+	if (dict->dupes)
+	    assert (dict->compare(nil->left->key, key, dict->context) <= 0);
+	else
+	    assert (dict->compare(nil->left->key, key, dict->context) < 0);
     }
     #endif
 
@@ -1152,7 +1151,7 @@ void dict_merge(dict_t *dest, dict_t *source)
 
     for (;;) {
 	if (leftnode != NULL && rightnode != NULL) {
-	    if (COMPARE(dest, leftnode->key, rightnode->key) < 0)
+	    if (dest->compare(leftnode->key, rightnode->key, dest->context) < 0)
 		goto copyleft;
 	    else
 		goto copyright;
@@ -1190,27 +1189,4 @@ void dict_merge(dict_t *dest, dict_t *source)
 
     dict_clear(source);
     dict_load_end(&load);
-}
-
-int dict_equal(dict_t* dict1, dict_t* dict2,
-               dict_value_eql_t value_eql)
-{
-    dnode_t* node1;
-    dnode_t* node2;
-
-    if (dict_count(dict1) != dict_count(dict2))
-        return 0; 
-    if (!dict_similar(dict1, dict2))
-        return 0;
-    
-    for (node1 = dict_first(dict1), node2 = dict_first(dict2);
-         node1 != NULL && node2 != NULL;
-         node1 = dict_next(dict1, node1), node2 = dict_next(dict2, node2)) {
-        
-        if (COMPARE(dict1, node1->key, node2->key) != 0)
-            return 0;
-        if (!value_eql(node1->data, node2->data))
-            return 0;
-    }
-    return 1;
 }
