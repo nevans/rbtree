@@ -459,7 +459,7 @@ rbtree_fetch(int argc, VALUE* argv, VALUE self)
  *
  */
 VALUE
-rbtree_size(VALUE self)
+rbtree_size(VALUE self, VALUE args, VALUE anEnum)
 {
     return ULONG2NUM(dict_count(DICT(self)));
 }
@@ -1523,7 +1523,7 @@ rbtree_bound_body(VALUE arg_)
 
 #ifdef HAVE_SIZED_ENUMERATOR
 static VALUE
-rbtree_bound_size(VALUE self, VALUE args)
+rbtree_bound_size(VALUE self, VALUE args, VALUE anEnum)
 {
     VALUE key1 = RARRAY_AREF(args, 0);
     VALUE key2 = RARRAY_AREF(args, RARRAY_LEN(args) - 1);
