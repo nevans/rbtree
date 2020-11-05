@@ -3,6 +3,11 @@
  * Copyright (c) 2002-2013 OZAWA Takuma
  */
 #include <ruby.h>
+#ifdef HAVE_RUBY_VERSION_H
+#include <ruby/version.h>
+#else
+#include <version.h>
+#endif
 #ifdef HAVE_RUBY_ST_H
 #include <ruby/st.h>
 #else
@@ -31,7 +36,12 @@
 #define RHASH_SET_IFNONE(h, v) (RHASH(h)->ifnone = (v))
 #endif
 
-#if defined(RUBY_API_VERSION_CODE) && (RUBY_API_VERSION_CODE < 20700)
+#ifndef RB_BLOCK_CALL_FUNC_ARGLIST
+#define RB_BLOCK_CALL_FUNC_ARGLIST(yielded_arg, callback_arg) \
+    VALUE yielded_arg, VALUE callback_arg
+#endif
+
+#if !defined(RUBY_API_VERSION_CODE) || (RUBY_API_VERSION_CODE < 20700)
 #define HAVE_TAINT
 #endif
 
@@ -50,11 +60,11 @@ typedef struct {
     int iter_lev;
 } rbtree_t;
 
-#define RBTREE(rbtree) DATA_PTR(rbtree)
-#define DICT(rbtree) ((rbtree_t*)RBTREE(rbtree))->dict
-#define IFNONE(rbtree) ((rbtree_t*)RBTREE(rbtree))->ifnone
-#define CMP_PROC(rbtree) ((rbtree_t*)RBTREE(rbtree))->cmp_proc
-#define ITER_LEV(rbtree) ((rbtree_t*)RBTREE(rbtree))->iter_lev
+#define RBTREE(rbtree) ((rbtree_t*)DATA_PTR(rbtree))
+#define DICT(rbtree) RBTREE(rbtree)->dict
+#define IFNONE(rbtree) RBTREE(rbtree)->ifnone
+#define CMP_PROC(rbtree) RBTREE(rbtree)->cmp_proc
+#define ITER_LEV(rbtree) RBTREE(rbtree)->iter_lev
 
 #define TO_KEY(arg) ((const void*)arg)
 #define TO_VAL(arg) ((void*)arg)
@@ -190,9 +200,9 @@ static VALUE
 rbtree_alloc(VALUE klass)
 {
     dict_t* dict;
-    VALUE rbtree = Data_Wrap_Struct(klass, rbtree_mark, rbtree_free, NULL);
-    RBTREE(rbtree) = ALLOC(rbtree_t);
-    MEMZERO(RBTREE(rbtree), rbtree_t, 1);
+    rbtree_t* rbtree_ptr;
+    VALUE rbtree = Data_Make_Struct(klass, rbtree_t, rbtree_mark, rbtree_free,
+                                    rbtree_ptr);
 
     dict = ALLOC(dict_t);
     dict_init(dict, rbtree_cmp);
@@ -201,9 +211,9 @@ rbtree_alloc(VALUE klass)
     if (!RTEST(rb_class_inherited_p(klass, RBTree)))
         dict_allow_dupes(dict);
 
-    DICT(rbtree) = dict;
-    IFNONE(rbtree) = Qnil;
-    CMP_PROC(rbtree) = Qnil;
+    rbtree_ptr->dict = dict;
+    rbtree_ptr->ifnone = Qnil;
+    rbtree_ptr->cmp_proc = Qnil;
     return rbtree;
 }
 
@@ -327,8 +337,9 @@ typedef struct {
 } rbtree_insert_arg_t;
 
 static VALUE
-insert_node_body(rbtree_insert_arg_t* arg)
+insert_node_body(rbtree_insert_arg_t* arg_)
 {
+    rbtree_insert_arg_t* arg = (rbtree_insert_arg_t*)arg_;
     dict_t* dict = arg->dict;
     dnode_t* node = arg->node;
 
@@ -345,8 +356,9 @@ insert_node_body(rbtree_insert_arg_t* arg)
 }
 
 static VALUE
-insert_node_ensure(rbtree_insert_arg_t* arg)
+insert_node_ensure(VALUE arg_)
 {
+    rbtree_insert_arg_t* arg = (rbtree_insert_arg_t*)arg_;
     dict_t* dict = arg->dict;
     dnode_t* node = arg->node;
 
@@ -598,8 +610,9 @@ rbtree_each_ensure(VALUE self)
 }
 
 static VALUE
-rbtree_each_body(rbtree_each_arg_t* arg)
+rbtree_each_body(VALUE arg_)
 {
+    rbtree_each_arg_t* arg = (rbtree_each_arg_t*)arg_;
     VALUE self = arg->self;
     dict_t* dict = DICT(self);
     dnode_t* node;
@@ -768,7 +781,7 @@ copy_dict(VALUE src, VALUE dest, dict_comp_t cmp_func, VALUE cmp_proc)
         DICT(dest) = t;
     }
     rbtree_free(RBTREE(temp));
-    RBTREE(temp) = NULL;
+    DATA_PTR(temp) = NULL;
     rb_gc_force_recycle(temp);
 
     DICT(dest)->dict_context = RBTREE(dest);
@@ -896,8 +909,9 @@ typedef struct {
 } rbtree_remove_if_arg_t;
 
 static VALUE
-rbtree_remove_if_ensure(rbtree_remove_if_arg_t* arg)
+rbtree_remove_if_ensure(rbtree_remove_if_arg_t* arg_)
 {
+    rbtree_remove_if_arg_t* arg = (rbtree_remove_if_arg_t*)arg_;
     dict_t* dict = DICT(arg->self);
     dnode_list_t* list = arg->list;
 
@@ -914,8 +928,9 @@ rbtree_remove_if_ensure(rbtree_remove_if_arg_t* arg)
 }
 
 static VALUE
-rbtree_remove_if_body(rbtree_remove_if_arg_t* arg)
+rbtree_remove_if_body(rbtree_remove_if_arg_t* arg_)
 {
+    rbtree_remove_if_arg_t* arg = (rbtree_remove_if_arg_t*)arg_;
     VALUE self = arg->self;
     dict_t* dict = DICT(self);
     dnode_t* node;
@@ -1480,8 +1495,9 @@ typedef struct {
 } rbtree_bound_arg_t;
 
 static VALUE
-rbtree_bound_body(rbtree_bound_arg_t* arg)
+rbtree_bound_body(VALUE arg_)
 {
+    rbtree_bound_arg_t* arg = (rbtree_bound_arg_t*)arg_;
     VALUE self = arg->self;
     dict_t* dict = DICT(self);
     dnode_t* lower_node = arg->lower_node;
