@@ -31,7 +31,7 @@
 #define RHASH_SET_IFNONE(h, v) (RHASH(h)->ifnone = (v))
 #endif
 
-#if !defined(RUBY_API_VERSION_CODE) || (RUBY_API_VERSION_CODE < 20700)
+#if defined(RUBY_API_VERSION_CODE) && (RUBY_API_VERSION_CODE < 20700)
 #define HAVE_TAINT
 #endif
 
